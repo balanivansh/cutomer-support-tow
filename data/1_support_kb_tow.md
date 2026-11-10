@@ -156,6 +156,10 @@ The Health Heart is the **broadcaster's** standing. It is shown on your profile 
 - 🔴 Red (at risk, 1 credit): multiple rejected recordings, policy violations, or long inactivity.
 To recover, post clear, high-quality, compliant singing recordings, avoid background noise, blank screens and non-musical broadcasts, and make sure none is marked "Rejected". See B13 and B14.
 
+### C11. How can I claim free Gold Coins in RoxStar?
+**Audience:** Participant
+If you have won Tug of War, free Gold Coins will be credited to you; they will appear in your account after a short time.
+
 ---
 
 ## PART D: LEADERBOARDS
@@ -170,12 +174,3 @@ Ranks users by total coins won this calendar month and shows total match wins. R
 
 ---
 
-## PART E: TIME AND RESET RULES (all IST)
-
-| What | Window | Reset |
-|---|---|---|
-| Daily broadcaster goal | 00:00 to 23:59:59 | Midnight |
-| Weekly review and credits | Mon–Sat performance, weekend review | Credits refreshed Monday |
-| Daily leaderboard | Each day | Midnight |
-| Monthly leaderboard | Calendar month | 00:00 on the 1st |
-| Voting window | 15 seconds | Per pair |

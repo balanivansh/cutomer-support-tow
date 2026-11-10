@@ -1,0 +1,13 @@
+{
+ "features": [
+  {
+   "id": "tow",
+   "name": "Tug of War",
+   "kb_file": "1_support_kb_tow.md",
+   "audiences": [
+    "Broadcaster",
+    "Participant"
+   ]
+  }
+ ]
+}

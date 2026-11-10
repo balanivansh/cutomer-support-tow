@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE TABLE IF NOT EXISTS proposals (
   id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'pending', action TEXT NOT NULL,
   chunk_id TEXT, part TEXT, title TEXT, audience TEXT, body TEXT, old_text TEXT, reason TEXT,
-  keywords TEXT, feedback_ids TEXT, examples TEXT, candidates TEXT, created_at TEXT NOT NULL);
+  keywords TEXT, feedback_ids TEXT, examples TEXT, candidates TEXT, extra TEXT, created_at TEXT NOT NULL);
 """
 
 
@@ -62,6 +62,10 @@ def init_db():
             pass
         try:  # older databases: proposals get a candidates column
             c.execute("ALTER TABLE proposals ADD COLUMN candidates TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:  # older databases: proposals get an extra column (feature, stored point, suggested question)
+            c.execute("ALTER TABLE proposals ADD COLUMN extra TEXT")
         except sqlite3.OperationalError:
             pass
     log_info("init_db", f"SQLite ready at {DB_PATH}")
@@ -206,6 +210,26 @@ def review_candidate_ids():
     return [f"f{r['id']}" for r in rows]
 
 
+def feedback_details(ids):
+    """ids like 'f12'. Returns {'f12': {id, customer_text, final_text, outcome, draft_status, draft_used,
+    draft_feature}}. draft_used = ids the draft relied on (KB points like 'B5' or past replies like 'f3')."""
+    nums = _nums(ids)
+    if not nums:
+        return {}
+    with _db() as c:
+        rows = c.execute(
+            "SELECT f.id, f.customer_text, f.final_text, f.outcome, d.status AS draft_status, d.used AS draft_used, "
+            "d.query AS draft_query FROM feedback f LEFT JOIN drafts d ON d.id = f.draft_id "
+            f"WHERE f.id IN ({','.join('?' * len(nums))})", nums).fetchall()
+    out = {}
+    for r in rows:
+        x = dict(r)
+        x["draft_used"] = json.loads(x["draft_used"] or "[]")
+        x["draft_feature"] = json.loads(x.pop("draft_query") or "{}").get("feature", "")
+        out[f"f{x['id']}"] = x
+    return out
+
+
 def set_feedback_status(ids, status):
     """status: active | merged (now in the KB) | rejected (reviewer said no)."""
     with _db() as c:
@@ -221,10 +245,11 @@ def add_proposal(p):
     with _db() as c:
         cur = c.execute(
             "INSERT INTO proposals (action, chunk_id, part, title, audience, body, old_text, reason, keywords,"
-            " feedback_ids, examples, candidates, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " feedback_ids, examples, candidates, extra, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (p["action"], p["chunk_id"], p["part"], p["title"], p["audience"], p["body"], p["old_text"],
              p["reason"], json.dumps(p["keywords"]), json.dumps(p["feedback_ids"]),
-             json.dumps(p["examples"], ensure_ascii=False), json.dumps(p["candidates"], ensure_ascii=False), _now()))
+             json.dumps(p["examples"], ensure_ascii=False), json.dumps(p.get("candidates") or [], ensure_ascii=False),
+             json.dumps(p.get("extra") or {}, ensure_ascii=False), _now()))
         return cur.lastrowid
 
 
@@ -232,6 +257,7 @@ def _proposal(r):
     d = dict(r)
     for k in ("keywords", "feedback_ids", "examples", "candidates"):
         d[k] = json.loads(d[k] or "[]")
+    d["extra"] = json.loads(d.get("extra") or "{}")
     return d
 
 

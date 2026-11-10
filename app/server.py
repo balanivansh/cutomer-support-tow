@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app import past_replies, review, store
+from app import features, past_replies, review, store
 from app.kb_common import log_error, log_info
 from app.llm import QUERY_MODEL, LLMError, chat_json
 from app.pipeline import generate_draft, get_retriever
@@ -183,12 +183,16 @@ async def send(cid: str, body: Send):
 
 class Apply(BaseModel):
     mode: str = "replace"  # replace | add
-    chunk_id: str = ""
-    part: str = ""
-    title: str = ""
-    audience: str = ""
+    feature: str = ""
+    part: str = ""  # topic letter, used by add only
+    title: str = ""  # the question
+    audience: str = ""  # "Broadcaster, Participant" or "Everyone"
     body: str = ""
     keywords: str = ""
+
+
+class NewAudience(BaseModel):
+    name: str
 
 
 @app.get("/review")
@@ -196,9 +200,23 @@ async def review_page():
     return FileResponse(REVIEW_HTML)
 
 
+@app.get("/api/features")
+async def features_list():
+    return [{"id": f["id"], "name": f["name"], "audiences": f.get("audiences", []), "topics": features.topics(f)}
+            for f in features.load()]
+
+
+@app.post("/api/features/{fid}/audience")
+async def features_add_audience(fid: str, b: NewAudience):
+    try:
+        return {"audiences": features.add_audience(fid, b.name)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/review/proposals")
 async def review_list():
-    return store.list_proposals("pending")
+    return [p for p in store.list_proposals("pending") if p.get("extra")]  # cards from the old page have no extra
 
 
 @app.post("/api/review/generate")
@@ -209,7 +227,7 @@ async def review_generate():
 @app.post("/api/review/{pid}/apply")
 async def review_apply(pid: int, b: Apply):
     try:
-        await asyncio.to_thread(review.apply_proposal, pid, b.mode, b.chunk_id, b.part, b.title, b.audience,
+        await asyncio.to_thread(review.apply_proposal, pid, b.mode, b.feature, b.part, b.title, b.audience,
                                 b.body, b.keywords)
     except ValueError as e:
         raise HTTPException(400, str(e))

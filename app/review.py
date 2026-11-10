@@ -1,35 +1,41 @@
-"""Weekly review. Active past replies are grouped by topic (local embeddings, no LLM). For each topic the
-LLM suggests one KB change. The reviewer sees the matching KB chunks and chooses:
-  Replace this Q&A (chunk rewritten in place), Add as new point, or Reject.
-Replace/Add: KB file is backed up and changed, KB is re-indexed, the replies stop being used (status 'merged').
-Reject: the replies stop being used (status 'rejected')."""
+"""Weekly review. Active past replies are grouped by topic (local embeddings). For each topic ONE small LLM call
+writes: the English question, the main solution (short summary if long), the topic and search words.
+The reviewer picks the feature, topic and audience, edits the text and presses:
+  Replace this Q&A (the stored point is overwritten), Add new (new point at the end of the topic) or Reject.
+Replace/Add: the answer is translated to English, the KB file is backed up and changed, the KB is re-indexed,
+the replies stop being used (status 'merged'). Reject: the replies stop being used (status 'rejected')."""
 import re
 import shutil
 import subprocess
 import sys
 import threading
+from collections import Counter
 from datetime import datetime
 
 import numpy as np
 
-from app import keywords, past_replies, store
+from app import features, keywords, past_replies, store
 from app.kb_common import KB_PATH, ROOT, log_error, log_info
-from app.llm import DRAFT_MODEL, LLMError, chat_json
+from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, chat_json
 from app.pipeline import get_retriever
 
 CLUSTER_SIM = 0.80  # English queries at least this similar = same topic
 MAX_TOPICS = 15
 MAX_EXAMPLES = 6
 HEAD = re.compile(r"^### ([A-Z]\d+)\. (.*)$")
+KB_ID = re.compile(r"^[A-Z]\d+$")
 _lock = threading.Lock()
 
-REVIEW_PROMPT = """You maintain a RoxStar support KB of Q&A chunks. You get KB chunks and past replies that human support agents approved for ONE topic. The agents are right: where they differ from the KB, the KB is outdated.
-Decide:
-- "replace": one KB chunk covers this topic. Return its chunk_id, its title (the question; keep or improve it) and the full new body. Rewrite the whole body so it stays consistent: fix or remove outdated lines, do not just append a line. If the KB already says the same, return the chunk unchanged.
-- "add": no KB chunk covers this topic. Return a new title (a question), audience, body and the part letter (B broadcaster topics, C participant topics, A overview, D leaderboards).
-Rules: plain English facts, short, same style as the KB, no promises, never invent facts beyond the replies. audience is one of: Everyone, Broadcaster, Participant, "Broadcaster, Participant". body = the text after the Audience line, without heading.
-Also list keywords: short RoxStar words customers use for this topic that are not in the keyword list (max 5, may be empty).
-JSON only: {"action": "replace|add", "chunk_id": "", "part": "", "title": "", "audience": "", "body": "", "reason": "one short sentence", "keywords": []}"""
+# Edit these two prompts freely. They are generic on purpose.
+REVIEW_PROMPT = """You help a support team add knowledge from the replies of human support agents. You get what customers asked and what the agents replied on ONE topic (oldest first).
+Return:
+- question: one clear English question a customer would ask on this topic, in plain words.
+- solution: the main answer the agents gave, for the reviewer to check. Skip replies that are only thanks, greetings or "we will check" replies. If the replies differ, follow the latest one. If the main answer is long (more than about 60 words), write a short summary of it instead and keep every fact. Keep the same language and script the agents used. Never add a fact that is not in the replies.
+- topic: the best matching name from the TOPIC LIST, copied exactly.
+- keywords: up to 5 short words customers use for this topic that are not in the KEYWORD LIST (may be empty).
+JSON only: {"question": "", "solution": "", "topic": "", "keywords": []}"""
+
+TRANSLATE_PROMPT = """Translate this support answer into clear, plain English for a knowledge base. Write it as facts: no greeting, no "Sir" or "Ma'am", no sentence that talks to one customer. Keep every fact, number, emoji and list. If it is already English, only tidy it. JSON only: {"english": ""}"""
 
 
 # ---------- KB markdown helpers ----------
@@ -78,8 +84,20 @@ def add_chunk(lines, part, title, audience, body):
     return lines[:end] + block + lines[end:], new_id
 
 
-def _kb_lines():
-    return KB_PATH.read_text(encoding="utf-8").splitlines()
+def _clean_body(text):
+    """Keeps reviewer text from breaking the KB structure (no heading or divider lines)."""
+    out = []
+    for line in text.strip().splitlines():
+        if line.strip() == "---":
+            continue
+        out.append(re.sub(r"^#+\s*", "", line.rstrip()))
+    return "\n".join(out).strip()
+
+
+def _audience_text(audience):
+    """'Broadcaster, Participant' stays; nothing ticked or only Everyone -> 'Everyone'."""
+    names = [a.strip() for a in (audience or "").split(",") if a.strip() and a.strip().lower() != "everyone"]
+    return ", ".join(names) or "Everyone"
 
 
 # ---------- build the weekly report ----------
@@ -90,6 +108,7 @@ def _clusters():
     data = past_replies._collection().get(ids=ids, include=["embeddings", "documents", "metadatas"])
     items = [{"id": i, "vec": np.array(v), "reply": d, "q": m.get("question", ""), "eq": m.get("english_query", "")}
              for i, v, d, m in zip(data["ids"], data["embeddings"], data["documents"], data["metadatas"])]
+    items.sort(key=lambda x: int(x["id"][1:]))  # oldest first
     clusters = []
     for it in items:
         for c in clusters:
@@ -102,36 +121,59 @@ def _clusters():
     return clusters[:MAX_TOPICS]
 
 
-def _propose(cluster):
-    lines = _kb_lines()
-    cands = []
-    for c in get_retriever().search(cluster[0]["eq"] or cluster[0]["q"], role=None, top_k=3):
+def _pick_feature(details):
+    """The feature the drafts named most often; else the first feature in features.json."""
+    names = Counter(d.get("draft_feature") for d in details if d.get("draft_feature"))
+    for name, _ in names.most_common():
+        f = features.find_by_name(name)
+        if f:
+            return f
+    return features.load()[0]
+
+
+def _stored_point(lines, details):
+    """The KB point the drafts answered from (most used). None if the drafts were holding replies
+    (NOT_IN_KB) or only used past replies."""
+    count = Counter()
+    for d in details:
+        if d.get("draft_status") != "ANSWERED":
+            continue
+        for u in d.get("draft_used") or []:
+            if KB_ID.match(str(u)):
+                count[str(u)] += 1
+                break
+    for cid, _ in count.most_common():
         try:
-            cands.append(chunk_info(lines, c["id"]))
+            return chunk_info(lines, cid)
         except ValueError:
-            pass
-    examples = cluster[:MAX_EXAMPLES]
-    user = ("KEYWORD LIST: " + ", ".join(keywords.load()) + "\n\nKB CHUNKS:\n" + "\n\n".join(c["text"] for c in cands)
-            + "\n\nPAST REPLIES:\n" + "\n".join(f"Q: {e['eq'] or e['q']}\nA: {e['reply']}" for e in examples))
+            continue
+    return None
+
+
+def _propose(cluster):
+    details = store.feedback_details([e["id"] for e in cluster]).values()
+    feature = _pick_feature(details)
+    lines = features.kb_path(feature).read_text(encoding="utf-8").splitlines()
+    stored = _stored_point(lines, details)
+    topics = features.topics(feature)
+    pairs = "\n".join(f"Customer: {e['eq'] or e['q']}\nAgent reply: {e['reply']}" for e in cluster[-MAX_EXAMPLES:])
+    user = ("TOPIC LIST: " + ", ".join(t["name"] for t in topics) + "\nKEYWORD LIST: " + ", ".join(keywords.load())
+            + "\n\nREPLIES (oldest first):\n" + pairs)
     data, _, _ = chat_json([{"role": "system", "content": REVIEW_PROMPT}, {"role": "user", "content": user}],
-                           DRAFT_MODEL, 1800, "review")
-    chosen = next((c for c in cands if c["id"] == (data.get("chunk_id") or "").strip()), None)
-    if data.get("action") == "replace" and chosen:
-        action, cid = "replace", chosen["id"]
-        title = data.get("title") or chosen["title"]
-        audience = data.get("audience") or chosen["audience"]
-        body = data.get("body") or chosen["body"]
-        part = cid[0]
-    else:  # no close chunk: suggest a new point
-        action, cid = "add", ""
-        title, audience, body = data.get("title") or "", data.get("audience") or "", data.get("body") or ""
-        part = (data.get("part") or (cands[0]["id"][0] if cands else "B")).strip().upper()[:1]
-    return {"action": action, "chunk_id": cid, "part": part, "title": title, "audience": audience, "body": body,
-            "old_text": "", "reason": data.get("reason") or "",
-            "keywords": [str(k) for k in (data.get("keywords") or [])][:5],
+                           DRAFT_MODEL, 1500, "review")
+    question = " ".join(str(data.get("question") or cluster[0]["eq"] or cluster[0]["q"]).split())
+    solution = str(data.get("solution") or cluster[-1]["reply"]).strip()
+    topic = str(data.get("topic") or "").strip().lower()
+    part = stored["id"][0] if stored else next((t["part"] for t in topics if t["name"].lower() == topic), "")
+    return {"action": "replace" if stored else "add", "chunk_id": stored["id"] if stored else "", "part": part,
+            "title": stored["title"] if stored else question,
+            "audience": stored["audience"] if stored else "Everyone",
+            "body": solution, "old_text": stored["body"] if stored else "", "reason": "",
+            "keywords": [str(k).strip() for k in (data.get("keywords") or []) if str(k).strip()][:5],
             "feedback_ids": [e["id"] for e in cluster],
             "examples": [{"q": e["eq"] or e["q"], "reply": e["reply"]} for e in cluster[:3]],
-            "candidates": [{k: c[k] for k in ("id", "title", "audience", "body")} for c in cands]}
+            "extra": {"feature_id": feature["id"], "llm_question": question,
+                      "stored": {k: stored[k] for k in ("id", "title", "audience", "body")} if stored else None}}
 
 
 def build_report():
@@ -143,8 +185,8 @@ def build_report():
             try:
                 store.add_proposal(_propose(cluster))
                 count += 1
-            except LLMError as e:
-                log_error("LLM_ERROR", "review", f"Could not make a proposal for topic {cluster[0]['id']}: {e}")
+            except (LLMError, OSError) as e:
+                log_error("LLM_ERROR", "review", f"Could not make a card for topic {cluster[0]['id']}: {e}")
         log_info("review", f"Weekly report ready: {count} topic(s)")
         return count
 
@@ -157,49 +199,77 @@ def _reingest():
         raise RuntimeError("KB re-index failed: " + (r.stderr or r.stdout)[-300:])
 
 
-def apply_proposal(pid, mode, chunk_id, part, title, audience, body, keywords_text):
-    """mode 'replace' rewrites chunk_id in place; mode 'add' adds a new chunk at the end of its part."""
+def _to_english(text):
+    try:
+        data, _, _ = chat_json([{"role": "system", "content": TRANSLATE_PROMPT}, {"role": "user", "content": text}],
+                               QUERY_MODEL, 1200, "review_translate")
+    except LLMError as e:
+        raise RuntimeError(f"Translation failed, please try again ({e})")
+    out = str(data.get("english") or "").strip()
+    if not out:
+        raise RuntimeError("Translation came back empty, please try again")
+    return out
+
+
+def apply_proposal(pid, mode, feature_id, part, title, audience, body, keywords_text):
+    """mode 'replace' overwrites the stored point of this card; mode 'add' adds a new point at the end of the
+    chosen topic. The answer is translated to English before it is saved."""
     p = store.get_proposal(pid)
     if not p or p["status"] != "pending":
-        raise ValueError("Proposal not found or already handled")
-    body, chunk_id = body.strip(), chunk_id.strip()
-    if not body:
-        raise ValueError("The text is empty")
-    if mode == "replace" and not chunk_id:
-        raise ValueError("Pick the KB chunk to replace")
-    if mode == "add" and not title.strip():
-        raise ValueError("A new point needs a title")
+        raise ValueError("This card was not found or is already handled")
+    feature = features.get(feature_id)
+    if not feature:
+        raise ValueError("Pick a feature")
+    title = " ".join(title.split())
+    body = body.strip()
     if mode not in ("replace", "add"):
-        raise ValueError("Unknown mode")
+        raise ValueError("Unknown action")
+    if not title:
+        raise ValueError("The question is empty")
+    if not body:
+        raise ValueError("The answer is empty")
+    if mode == "replace":
+        chunk_id = (p.get("chunk_id") or "").strip()
+        if not chunk_id or feature_id != (p.get("extra") or {}).get("feature_id"):
+            raise ValueError("Nothing is stored for this one. Use Add new")
+    else:
+        chunk_id = ""
+        if not part.strip():
+            raise ValueError("Pick a topic")
+    kb = features.kb_path(feature)
+    if kb.resolve() != KB_PATH.resolve():
+        raise ValueError("This feature is not set up for review yet")
+    audience_text = _audience_text(audience)
+    english = _clean_body(_to_english(body))  # before the KB is touched: a failed translation changes nothing
     with _lock:
-        lines = _kb_lines()
+        lines = kb.read_text(encoding="utf-8").splitlines()
         if mode == "replace":
-            new_lines, target = edit_chunk(lines, chunk_id, title, audience, body), chunk_id
+            new_lines, target = edit_chunk(lines, chunk_id, title, audience_text, english), chunk_id
         else:
-            new_lines, target = add_chunk(lines, part or "B", title, audience, body)
-        backup_dir = KB_PATH.parent / "kb_backups"
+            new_lines, target = add_chunk(lines, part, title, audience_text, english)
+        backup_dir = kb.parent / "kb_backups"
         backup_dir.mkdir(exist_ok=True)
         backup = backup_dir / f"kb_{datetime.now():%Y%m%d_%H%M%S}.md"
-        shutil.copy2(KB_PATH, backup)
-        KB_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        shutil.copy2(kb, backup)
+        kb.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         try:
             _reingest()
         except Exception:
-            shutil.copy2(backup, KB_PATH)  # put the old KB back
+            shutil.copy2(backup, kb)  # put the old KB back
             raise
         import app.pipeline as pipeline_mod
         pipeline_mod._retriever = None  # next search opens the re-indexed KB
         get_retriever()
         log_info("review", f"Proposal {pid}: {mode} {target} applied, backup {backup.name}")
         store.set_feedback_status(p["feedback_ids"], "merged")
-        keywords.add(keywords_text.split(","))
-        store.set_proposal_status(pid, "approved", title, audience, body, mode, target)
+        keywords.add((keywords_text or "").split(","))
+        store.set_proposal_status(pid, "approved", title, audience_text, english, mode, target)
 
 
 def reject_proposal(pid):
     p = store.get_proposal(pid)
     if not p or p["status"] != "pending":
-        raise ValueError("Proposal not found or already handled")
+        raise ValueError("This card was not found or is already handled")
     store.set_feedback_status(p["feedback_ids"], "rejected")
     store.set_proposal_status(pid, "rejected")
     log_info("review", f"Proposal {pid} rejected, {len(p['feedback_ids'])} repl(ies) marked rejected")

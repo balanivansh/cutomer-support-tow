@@ -3,29 +3,34 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Weekly KB review</title>
+<title>Weekly review</title>
 <style>
 :root{--bg:#f3f4f6;--panel:#fff;--line:#d9dce1;--ink:#1c1f24;--mute:#667085;--accent:#1f5eff}
 @media (prefers-color-scheme:dark){:root{--bg:#14161a;--panel:#1d2025;--line:#32363d;--ink:#e9ebee;--mute:#9aa1ab;--accent:#6b9bff}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif;padding:16px;max-width:900px;margin-inline:auto}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,"Noto Sans Devanagari",sans-serif;padding:16px;max-width:900px;margin-inline:auto}
 h1{font-size:20px;margin:0 0 12px}
 .top{display:flex;gap:10px;align-items:center;margin-bottom:12px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:12px}
-.badge{display:inline-block;padding:1px 8px;border-radius:10px;border:1px solid var(--line);font-size:12px;margin-right:6px}
 .mute{color:var(--mute);font-size:13px}
-pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px/1.4 ui-monospace,monospace;margin:6px 0}
+pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px/1.4 system-ui,"Noto Sans Devanagari",sans-serif;margin:6px 0}
 input,textarea,select{width:100%;font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px;margin:4px 0 8px}
+input[type=checkbox]{width:auto;margin:0 6px 0 0}
 textarea{min-height:120px;resize:vertical}
 button{font:inherit;padding:7px 14px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-button:disabled{opacity:.5}
-.err{color:#c0362c;font-size:13px}
-.ex{border-left:3px solid var(--line);padding-left:8px;margin:6px 0}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.err{color:#c0362c;font-size:13px;margin-top:6px}
+.stored{border-left:3px solid var(--accent);padding-left:8px;margin:8px 0 10px}
+.row2{display:flex;gap:10px}
+.row2>div{flex:1}
+.chk{display:inline-flex;align-items:center;margin:0 14px 6px 0;cursor:pointer}
+.small{max-width:460px}
 </style>
 </head>
 <body>
-<h1>Weekly KB review</h1>
+<h1>Weekly review</h1>
 <div class="top">
   <button class="primary" id="gen">Generate report</button>
   <span class="mute" id="status"></span>
@@ -40,76 +45,121 @@ async function api(path, opts) {
 }
 const post = (p, b) => api(p, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b || {})});
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+const parseAud = s => (s || '').split(',').map(a => a.trim()).filter(a => a && a.toLowerCase() !== 'everyone');
+let FEATURES = [];
 
 function card(p) {
+  const x = p.extra || {}, st = x.stored || null;
   const c = el('div', 'card');
-  const cands = p.candidates || [];
-  const head = el('div');
-  head.append(el('span', 'badge', 'AI suggests: ' + (p.action === 'replace' ? 'replace ' + p.chunk_id : 'add as new point')),
-    el('span', 'mute', p.feedback_ids.length + ' past repl' + (p.feedback_ids.length === 1 ? 'y' : 'ies')));
-  c.append(head, el('p', '', p.reason));
-  c.append(el('div', 'mute', 'What agents replied:'));
-  p.examples.forEach(x => { const d = el('div', 'ex'); d.append(el('div', 'mute', 'Q: ' + x.q), el('div', '', x.reply)); c.append(d); });
+  const n = p.feedback_ids.length;
+  c.append(el('div', 'mute', n + ' agent repl' + (n === 1 ? 'y' : 'ies') + ' on this topic'));
 
-  c.append(el('div', 'mute', 'This is what the KB has (pick the chunk to replace):'));
-  const sel = el('select');
-  const none = el('option', '', '(none - new topic)'); none.value = ''; sel.append(none);
-  cands.forEach(k => { const o = el('option', '', k.id + '. ' + k.title); o.value = k.id; sel.append(o); });
-  sel.value = p.chunk_id || '';
-  c.append(sel);
-  const kb = el('pre'); c.append(kb);
+  const sd = el('div', 'stored');
+  const line = el('div');
+  line.append(el('b', '', 'What is currently stored: '), document.createTextNode(st ? st.title : 'Not stored'));
+  sd.append(line);
+  if (st) sd.append(el('pre', '', st.body));
+  c.append(sd);
 
-  c.append(el('div', 'mute', 'Title (the question)'));
-  const title = el('input'); c.append(title);
+  // feature + topic
+  const row = el('div', 'row2');
+  const fw = el('div'), tw = el('div');
+  const fsel = el('select'), tsel = el('select');
+  FEATURES.forEach(f => { const o = el('option', '', f.name); o.value = f.id; fsel.append(o); });
+  fsel.value = x.feature_id || '';
+  fw.append(el('div', 'mute', 'Feature'), fsel);
+  tw.append(el('div', 'mute', 'Topic'), tsel);
+  row.append(fw, tw);
+  c.append(row);
+  const feat = () => FEATURES.find(f => f.id === fsel.value);
+  const drawTopics = () => {
+    tsel.innerHTML = '';
+    const ph = el('option', '', 'Choose topic...'); ph.value = ''; tsel.append(ph);
+    ((feat() || {}).topics || []).forEach(t => { const o = el('option', '', t.name); o.value = t.part; tsel.append(o); });
+    const want = fsel.value === x.feature_id ? (p.part || '') : '';
+    tsel.value = [...tsel.options].some(o => o.value === want) ? want : '';
+  };
+
+  c.append(el('div', 'mute', 'Question (English)'));
+  const question = el('input'); question.value = p.title || ''; c.append(question);
+
+  // audience: nothing ticked = Everyone
   c.append(el('div', 'mute', 'Audience'));
-  const aud = el('input'); c.append(aud);
-  c.append(el('div', 'mute', 'Answer text (you can edit)'));
-  const body = el('textarea'); c.append(body);
-  c.append(el('div', 'mute', 'Part for a new point (A overview, B broadcaster, C participant, D leaderboards)'));
-  const part = el('input'); part.value = p.part || 'B'; part.maxLength = 1; c.append(part);
-  c.append(el('div', 'mute', 'New keywords (comma separated)'));
-  const kw = el('input'); kw.value = (p.keywords || []).join(', '); c.append(kw);
-
-  const fill = () => {
-    const k = cands.find(x => x.id === sel.value);
-    if (k) { kb.textContent = '### ' + k.id + '. ' + k.title + '\nAudience: ' + k.audience + '\n' + k.body; }
-    else { kb.textContent = 'No chunk selected.'; }
-    if (k && k.id === p.chunk_id) { title.value = p.title; aud.value = p.audience; body.value = p.body; }
-    else if (k) { title.value = k.title; aud.value = k.audience; body.value = k.body; part.value = k.id[0]; }
-    else { title.value = p.action === 'add' ? p.title : ''; aud.value = p.action === 'add' ? p.audience : ''; body.value = p.action === 'add' ? p.body : ''; }
-    rep.disabled = !k;
-  };
-
+  const audBox = el('div'); c.append(audBox);
+  let selected = parseAud(p.audience);
   const msg = el('div', 'err');
-  const rep = el('button', 'primary', 'Replace this Q&A');
-  const add = el('button', '', 'Add as new point');
-  const no = el('button', '', 'Reject');
-  const btns = [rep, add, no];
-  const run = async (fn) => {
-    btns.forEach(b => b.disabled = true); msg.textContent = '';
-    try { await fn(); c.remove(); left(); } catch (e) { msg.textContent = e.message; btns.forEach(b => b.disabled = false); fill(); }
+  const drawAud = () => {
+    audBox.innerHTML = '';
+    const mk = (label, checked, onchange) => {
+      const l = el('label', 'chk'); const i = document.createElement('input');
+      i.type = 'checkbox'; i.checked = checked; i.onchange = () => onchange(i.checked);
+      l.append(i, label); return l;
+    };
+    audBox.append(mk('Everyone', !selected.length, v => { if (v) selected = []; drawAud(); }));
+    [...new Set([...((feat() || {}).audiences || []), ...selected])].forEach(a =>
+      audBox.append(mk(a, selected.includes(a), v => { selected = v ? [...selected, a] : selected.filter(s => s !== a); drawAud(); })));
+    const addA = el('button', '', '+ Add audience');
+    addA.onclick = async () => {
+      const f = feat(); const name = (prompt('New audience name') || '').trim();
+      if (!f || !name) return;
+      try {
+        const r = await post('/api/features/' + f.id + '/audience', {name});
+        f.audiences = r.audiences;
+        const hit = r.audiences.find(a => a.toLowerCase() === name.toLowerCase()) || name;
+        if (!selected.includes(hit)) selected = [...selected, hit];
+        msg.textContent = ''; drawAud();
+      } catch (e) { msg.textContent = e.message; }
+    };
+    audBox.append(addA);
   };
-  const apply = mode => run(() => post('/api/review/' + p.id + '/apply',
-    {mode, chunk_id: sel.value, part: part.value, title: title.value, audience: aud.value, body: body.value, keywords: kw.value}));
+
+  c.append(el('div', 'mute', 'Answer (edit if needed)'));
+  const body = el('textarea'); body.value = p.body || ''; c.append(body);
+  c.append(el('div', 'mute', 'Search words (comma separated)'));
+  const kw = el('input', 'small'); kw.value = (p.keywords || []).join(', '); c.append(kw);
+
+  const rep = el('button', 'primary', 'Replace this Q&A');
+  const add = el('button', '', 'Add new');
+  const no = el('button', '', 'Reject');
+  const sync = () => { rep.disabled = !(st && fsel.value === x.feature_id); };
+  const run = async (fn) => {
+    [rep, add, no].forEach(b => b.disabled = true); msg.textContent = '';
+    try { await fn(); c.remove(); left(); }
+    catch (e) { msg.textContent = e.message; add.disabled = false; no.disabled = false; sync(); }
+  };
+  const apply = mode => run(() => post('/api/review/' + p.id + '/apply', {
+    mode, feature: fsel.value, part: tsel.value, title: question.value, audience: selected.join(', '),
+    body: body.value, keywords: kw.value}));
   rep.onclick = () => apply('replace');
-  add.onclick = () => apply('add');
+  add.onclick = () => {
+    if (st && question.value.trim() === st.title.trim()) {  // a new point needs its own question
+      const q = (x.llm_question || '').trim();
+      if (!q || q === st.title.trim()) { msg.textContent = 'Type a new question for the new point.'; return; }
+      question.value = q;
+      msg.textContent = 'New question filled in. Check it, then press Add new again.';
+      return;
+    }
+    apply('add');
+  };
   no.onclick = () => run(() => post('/api/review/' + p.id + '/reject'));
-  sel.onchange = fill;
-  const row = el('div'); row.append(rep, ' ', add, ' ', no);
-  c.append(row, msg);
-  fill();
+  fsel.onchange = () => { drawTopics(); drawAud(); sync(); };
+
+  const btns = el('div'); btns.append(rep, ' ', add, ' ', no);
+  c.append(btns, msg);
+  drawTopics(); drawAud(); sync();
   return c;
 }
 
 function left() { const n = $('list').children.length; $('status').textContent = n ? n + ' topic(s) to review' : 'Nothing left to review.'; }
 async function load() {
+  FEATURES = await api('/api/features');
   const items = await api('/api/review/proposals');
   $('list').innerHTML = '';
   items.forEach(p => $('list').append(card(p)));
   left();
 }
 $('gen').onclick = async () => {
-  $('gen').disabled = true; $('status').textContent = 'Generating… this can take a minute.';
+  $('gen').disabled = true; $('status').textContent = 'Generating... this can take a minute.';
   try { const r = await post('/api/review/generate'); await load(); if (!r.count) $('status').textContent = 'No new replies to review.'; }
   catch (e) { $('status').textContent = 'Failed: ' + e.message; }
   $('gen').disabled = false;
