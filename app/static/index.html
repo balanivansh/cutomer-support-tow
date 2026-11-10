@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoxStar support draft assistant</title>
+<style>
+:root{--bg:#f3f4f6;--panel:#fff;--line:#d9dce1;--ink:#1c1f24;--mute:#667085;--cust:#e8f1ff;--agent:#eef6ec;--accent:#1f5eff}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--panel:#1d2025;--line:#32363d;--ink:#e9ebee;--mute:#9aa1ab;--cust:#1c2f4d;--agent:#1f3322;--accent:#6b9bff}}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,"Noto Sans Devanagari",sans-serif;display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}
+.pane{background:var(--panel);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;min-height:0}
+.head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--line);font-weight:600}
+.msgs{flex:1;overflow:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.bub{max-width:80%;padding:7px 11px;border-radius:8px;white-space:pre-wrap;word-break:break-word}
+.bub small{display:block;color:var(--mute);font-size:11px;margin-top:2px}
+.customer{background:var(--cust)}.agent{background:var(--agent)}
+.right{align-self:flex-end}
+.row{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--line)}
+input[type=text],textarea{flex:1;font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px}
+textarea{width:100%;min-height:110px;resize:vertical}
+button{font:inherit;padding:7px 14px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.draftbox{padding:10px 14px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px;overflow:auto;max-height:62%}
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--mute);font-size:13px}
+#newsug{background:#fff4d6;border-color:#e3c15a;color:#5c4400}
+#meta,#preview{white-space:pre-wrap;font-size:13px;color:var(--mute);border:1px dashed var(--line);border-radius:6px;padding:8px}
+#preview{color:var(--ink)}
+#err{color:#c0362c;font-size:13px;padding:0 14px 8px}
+[hidden]{display:none!important}
+@media (max-width:800px){body{grid-template-columns:1fr;height:auto}.pane{height:70vh}}
+</style>
+</head>
+<body>
+<section class="pane" aria-label="Customer simulator">
+  <div class="head"><span>Customer</span><button id="newchat">New chat</button></div>
+  <div class="msgs" id="custmsgs"></div>
+  <div class="row">
+    <input type="text" id="custin" placeholder="Type as the customer" autocomplete="off">
+    <button class="primary" id="custsend">Send</button>
+  </div>
+</section>
+
+<section class="pane" aria-label="Support agent">
+  <div class="head"><span>Support agent</span><span id="pending" class="bar"></span></div>
+  <div class="msgs" id="agentmsgs"></div>
+  <div class="draftbox">
+    <button id="newsug" hidden>New suggestion available. Replace my text</button>
+    <textarea id="draft" placeholder="Draft reply appears here. Edit it, then send." aria-label="Draft reply"></textarea>
+    <div class="bar">
+      <label><input type="checkbox" id="engtoggle"> English preview</label>
+      <button id="engrefresh" hidden>Refresh preview</button>
+      <span id="outcome"></span>
+    </div>
+    <div id="preview" hidden></div>
+    <div id="meta" hidden></div>
+    <div><button class="primary" id="agentsend">Send reply</button></div>
+  </div>
+  <div id="err"></div>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+let convId = localStorage.getItem('conv');
+let lastKey = '', loadedText = '', loadedDraftId = null, suggestion = null;
+const previewCache = {};
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { const e = new Error((await r.text()).slice(0, 200)); e.status = r.status; throw e; }
+  return r.json();
+}
+const post = (p, b) => api(p, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b || {})});
+const showErr = m => { $('err').textContent = m || ''; };
+
+async function newChat() {
+  const r = await post('/api/conversations');
+  convId = r.id; localStorage.setItem('conv', convId);
+  lastKey = ''; loadedText = ''; loadedDraftId = null; suggestion = null;
+  $('draft').value = ''; $('newsug').hidden = true; $('meta').hidden = true; $('preview').hidden = true;
+  $('outcome').textContent = ''; $('custmsgs').innerHTML = ''; $('agentmsgs').innerHTML = '';
+}
+
+function renderMsgs(el, msgs, me) {
+  el.innerHTML = '';
+  msgs.forEach(m => {
+    const d = document.createElement('div');
+    d.className = 'bub ' + m.sender + (m.sender === me ? ' right' : '');
+    d.textContent = m.text;
+    const t = document.createElement('small');
+    t.textContent = new Date(m.created_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    d.appendChild(t);
+    el.appendChild(d);
+  });
+  el.scrollTop = el.scrollHeight;
+}
+
+function metaText(d) {
+  const q = d.query || {}, t = d.tokens || {};
+  const fmt = v => typeof v === 'number' ? v.toFixed(2) : '-';
+  const lines = [
+    'Status: ' + d.status + (d.error ? ' (' + d.error + ')' : ''),
+    'Used: ' + ((d.used || []).join(', ') || 'none'),
+    'Retrieved: ' + ((d.sources || []).map(s => s.id + ' ' + fmt(s.dense_sim)).join(', ') || 'none'),
+    'Intent: ' + (q.intent || '-') + ' | Role: ' + (q.role_guess || '-') + ' | Language: ' + (q.language_and_script || '-'),
+    'English query: ' + (q.english_query || '-'),
+    'Tokens in/out: ' + (t.in ?? '-') + '/' + (t.out ?? '-') + ' | ' + (d.ms ?? '-') + ' ms'
+  ];
+  return lines.join('\n');
+}
+
+function applyDraft(d) {
+  $('draft').value = d.draft || '';
+  loadedText = $('draft').value; loadedDraftId = d.id; suggestion = null;
+  $('newsug').hidden = true;
+  $('meta').textContent = metaText(d); $('meta').hidden = false;
+  if ($('engtoggle').checked) preview(false);
+}
+
+function handleDraft(s) {
+  $('pending').textContent = s.pending ? 'Drafting…' : '';
+  const d = s.draft, dirty = $('draft').value !== loadedText;
+  if (!d) {
+    suggestion = null; $('newsug').hidden = true;
+    if (!dirty) { $('draft').value = ''; loadedText = ''; loadedDraftId = null; $('meta').hidden = true; }
+    return;
+  }
+  if (d.id === loadedDraftId) return;
+  if (!dirty) applyDraft(d);
+  else { suggestion = d; $('newsug').hidden = false; }
+}
+
+function render(s) {
+  const key = s.messages.length + ':' + (s.messages.length ? s.messages[s.messages.length - 1].id : 0);
+  if (key !== lastKey) {
+    lastKey = key;
+    renderMsgs($('custmsgs'), s.messages, 'customer');
+    renderMsgs($('agentmsgs'), s.messages, 'agent');
+  }
+  handleDraft(s);
+}
+
+let ws = null;
+async function connect() {
+  if (ws) { ws.onclose = null; ws.close(); }
+  try {
+    render(await api('/api/conversations/' + convId + '/state')); showErr('');
+  } catch (e) {
+    if (e.status === 404) { await newChat(); return connect(); }
+    showErr('Cannot reach the server: ' + e.message); setTimeout(connect, 3000); return;
+  }
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/' + convId);
+  ws.onmessage = ev => { render(JSON.parse(ev.data)); showErr(''); };
+  ws.onclose = () => { showErr('Connection lost. Reconnecting…'); setTimeout(connect, 2000); };
+}
+
+async function customerSend() {
+  const text = $('custin').value.trim();
+  if (!text) return;
+  if (!convId) await newChat();
+  $('custin').value = '';
+  try { await post('/api/conversations/' + convId + '/customer', {text}); }
+  catch (e) { showErr('Message not sent: ' + e.message); }
+}
+
+async function agentSend() {
+  const text = $('draft').value.trim();
+  if (!text || !convId) return;
+  $('agentsend').disabled = true;
+  try {
+    const r = await post('/api/conversations/' + convId + '/send', {text, draft_id: loadedDraftId});
+    $('outcome').textContent = 'Sent (' + r.outcome + ')';
+    $('draft').value = ''; loadedText = ''; loadedDraftId = null; suggestion = null;
+    $('newsug').hidden = true; $('meta').hidden = true; $('preview').hidden = true; $('engtoggle').checked = false;
+    $('engrefresh').hidden = true;
+  } catch (e) { showErr('Reply not sent: ' + e.message); }
+  $('agentsend').disabled = false;
+}
+
+async function preview(force) {
+  const text = $('draft').value.trim(), box = $('preview');
+  box.hidden = false;
+  if (!text) { box.textContent = 'Nothing to translate.'; return; }
+  if (!force && previewCache[text]) { box.textContent = previewCache[text]; return; }
+  box.textContent = 'Translating…';
+  try {
+    const r = await post('/api/translate', {text});
+    previewCache[text] = r.english; box.textContent = r.english;
+  } catch (e) { box.textContent = 'Preview failed: ' + e.message; }
+}
+
+$('newchat').onclick = async () => { await newChat(); connect(); };
+$('custsend').onclick = customerSend;
+$('custin').addEventListener('keydown', e => { if (e.key === 'Enter') customerSend(); });
+$('agentsend').onclick = agentSend;
+$('newsug').onclick = () => { if (suggestion) applyDraft(suggestion); };
+$('engtoggle').onchange = e => {
+  $('engrefresh').hidden = !e.target.checked;
+  if (e.target.checked) preview(false); else $('preview').hidden = true;
+};
+$('engrefresh').onclick = () => preview(true);
+
+(async () => { if (!convId) await newChat(); connect(); })();
+</script>
+</body>
+</html>
