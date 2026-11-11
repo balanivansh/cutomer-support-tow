@@ -85,7 +85,7 @@ def parse_kb(text):
 def main():
     if not KB_PATH.exists():
         log_error("CONFIG_ERROR", "read_kb",
-                  f"KB file not found at {KB_PATH}. Copy 1_support_kb_tow.md into data/ or fix KB_PATH in .env.")
+                  f"KB file not found at {KB_PATH}. Copy cust_supp_kb.md into data/ or fix KB_PATH in .env.")
         sys.exit(1)
     chunks = parse_kb(KB_PATH.read_text(encoding="utf-8"))
     ids = [c["id"] for c in chunks]

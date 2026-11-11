@@ -21,7 +21,7 @@ def _path(name, default):
     return p if p.is_absolute() else (ROOT / p).resolve()
 
 
-KB_PATH = _path("KB_PATH", "./data/1_support_kb_tow.md")
+KB_PATH = _path("KB_PATH", "./data/cust_supp_kb.md")
 CHROMA_PATH = _path("CHROMA_PATH", "./data/chroma")
 LOG_DIR = _path("LOG_DIR", "./logs")
 EMBEDDING_MODE = _env("EMBEDDING_MODE", "local")

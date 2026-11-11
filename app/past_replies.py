@@ -1,18 +1,15 @@
-"""Past approved replies (stage 4b). Agent replies saved in the SQLite `feedback` table are embedded
-(by the clean English query, so they match the pipeline's search query) into the Chroma collection
-`past_replies`. Past replies are optional: any failure here returns [] and drafting continues.
+"""Private weekly-review candidates. Edited or rewritten agent replies saved in
+SQLite are embedded so the review page can group similar corrections.  This
+collection is deliberately not queried by the draft pipeline: only a reviewer
+can promote facts into the authoritative KB.
 Rebuild everything from SQLite:  python -m app.past_replies"""
 import os
-
 import chromadb
 
 from app import store
 from app.kb_common import CHROMA_PATH, embed, log_error, log_info
 
 PAST_COLLECTION = "past_replies"
-PAST_SIM_THRESHOLD = float(os.getenv("PAST_SIM_THRESHOLD") or 0.75)  # min similarity of English queries
-PAST_TOP_K = int(os.getenv("PAST_TOP_K") or 2)
-
 _col = None
 
 
@@ -61,18 +58,21 @@ def index_pending():
         indexed = len(keep)
     store.mark_feedback_indexed([r["id"] for r, _ in skip], 2)
     log_info("past_index", f"Indexed {indexed} past repl{'y' if indexed == 1 else 'ies'}, skipped {len(skip)}")
-    return indexed
+PAST_SIM_THRESHOLD = float(os.getenv("PAST_SIM_THRESHOLD") or 0.75)  # min similarity of English queries
+PAST_TOP_K = int(os.getenv("PAST_TOP_K") or 2)
 
 
-def search(english_query, conv_id=None):
-    """Returns up to PAST_TOP_K [{id, question, reply, sim, outcome, created_at}], best first."""
+def search(english_query, conv_id=None, query_vector=None):
+    """Returns up to PAST_TOP_K [{id, question, reply, sim, outcome, created_at}], best first.
+    These are recent agent-approved replies that win over the KB during the week until reviewed."""
     tag = f"conv={conv_id} " if conv_id else ""
     try:
         col = _collection()
         n = col.count()
         if n == 0:
             return []
-        res = col.query(query_embeddings=[embed([english_query])[0]], n_results=min(PAST_TOP_K * 4, n),
+        qv = query_vector if query_vector is not None else embed([english_query])[0]
+        res = col.query(query_embeddings=[qv], n_results=min(PAST_TOP_K * 4, n),
                         include=["documents", "metadatas", "distances"])
     except Exception as e:
         log_error("RETRIEVAL_ERROR", "past_search", f"{tag}Past-reply search failed; continuing without it", e)

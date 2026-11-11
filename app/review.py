@@ -1,4 +1,4 @@
-"""Weekly review. Active past replies are grouped by topic (local embeddings). For each topic ONE small LLM call
+"""Weekly review. Private reply candidates are grouped by topic (local embeddings). For each topic ONE small LLM call
 writes: the English question, the main solution (short summary if long), the topic and search words.
 The reviewer picks the feature, topic and audience, edits the text and presses:
   Replace this Q&A (the stored point is overwritten), Add new (new point at the end of the topic) or Reject.
@@ -21,7 +21,7 @@ from app.pipeline import get_retriever
 
 CLUSTER_SIM = 0.80  # English queries at least this similar = same topic
 MAX_TOPICS = 15
-MAX_EXAMPLES = 6
+MAX_EXAMPLES = 3
 HEAD = re.compile(r"^### ([A-Z]\d+)\. (.*)$")
 KB_ID = re.compile(r"^[A-Z]\d+$")
 _lock = threading.Lock()
@@ -36,6 +36,8 @@ Return:
 JSON only: {"question": "", "solution": "", "topic": "", "keywords": []}"""
 
 TRANSLATE_PROMPT = """Translate this support answer into clear, plain English for a knowledge base. Write it as facts: no greeting, no "Sir" or "Ma'am", no sentence that talks to one customer. Keep every fact, number, emoji and list. If it is already English, only tidy it. JSON only: {"english": ""}"""
+
+TRANSLATE_QUESTION_PROMPT = """Translate or reframe this question into a clear, concise English heading/question for a knowledge base (for example: "Why is Tug and PK not showing to me?"). Keep it short, direct, and in plain English. If it is already in clear English, keep it as is. JSON only: {"english": ""}"""
 
 
 # ---------- KB markdown helpers ----------
@@ -70,12 +72,31 @@ def edit_chunk(lines, cid, title, audience, body):
 
 
 def add_chunk(lines, part, title, audience, body):
-    part = part.strip().upper()[:1]
-    nums = [int(m.group(1)[1:]) for m in (HEAD.match(l) for l in lines) if m and m.group(1)[0] == part]
-    new_id = f"{part}{max(nums, default=0) + 1}"
-    start = next((n for n, l in enumerate(lines) if l.startswith(f"## PART {part}")), None)
+    part_str = (part or "").strip()
+    if len(part_str) == 1 and part_str.isalpha():
+        part_letter = part_str.upper()
+        topic_title = f"TOPIC {part_letter}"
+    else:
+        existing_parts = [m.group(1).upper() for m in (re.match(r"^##\s+PART\s+([A-Z]):", l) for l in lines) if m]
+        next_letters = [chr(c) for c in range(ord('A'), ord('Z') + 1) if chr(c) not in existing_parts]
+        part_letter = next_letters[0] if next_letters else "Z"
+        topic_title = part_str.upper() if part_str else f"TOPIC {part_letter}"
+
+    nums = [int(m.group(1)[1:]) for m in (HEAD.match(l) for l in lines) if m and m.group(1)[0] == part_letter]
+    new_id = f"{part_letter}{max(nums, default=0) + 1}"
+    start = next((n for n, l in enumerate(lines) if l.startswith(f"## PART {part_letter}")), None)
     if start is None:
-        raise ValueError(f"Part {part} not found in the KB file")
+        new_block = [
+            "",
+            "---",
+            "",
+            f"## PART {part_letter}: {topic_title}",
+            "",
+            f"### {new_id}. {title.strip()}",
+            f"**Audience:** {audience.strip() or 'Everyone'}",
+        ] + body.strip().splitlines()
+        return lines + new_block, new_id
+
     end = next((n for n in range(start + 1, len(lines)) if lines[n].strip() == "---"), len(lines))
     while end > start + 1 and not lines[end - 1].strip():
         end -= 1
@@ -179,6 +200,9 @@ def _propose(cluster):
 def build_report():
     """Replaces pending proposals with fresh ones. Returns how many topics were proposed."""
     with _lock:
+        # This collection is only a private review workspace. Draft generation
+        # never queries it, so an unreviewed human reply cannot affect customers.
+        past_replies.index_pending()
         store.clear_pending_proposals()
         count = 0
         for cluster in _clusters():
@@ -202,7 +226,7 @@ def _reingest():
 def _to_english(text):
     try:
         data, _, _ = chat_json([{"role": "system", "content": TRANSLATE_PROMPT}, {"role": "user", "content": text}],
-                               QUERY_MODEL, 1200, "review_translate")
+                               QUERY_MODEL, 300, "review_translate")
     except LLMError as e:
         raise RuntimeError(f"Translation failed, please try again ({e})")
     out = str(data.get("english") or "").strip()
@@ -211,9 +235,22 @@ def _to_english(text):
     return out
 
 
+def _question_to_english(text):
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        data, _, _ = chat_json([{"role": "system", "content": TRANSLATE_QUESTION_PROMPT}, {"role": "user", "content": text}],
+                               QUERY_MODEL, 200, "review_translate_question")
+        out = str(data.get("english") or "").strip()
+        return out if out else text
+    except Exception:
+        return text
+
+
 def apply_proposal(pid, mode, feature_id, part, title, audience, body, keywords_text):
     """mode 'replace' overwrites the stored point of this card; mode 'add' adds a new point at the end of the
-    chosen topic. The answer is translated to English before it is saved."""
+    chosen topic. Both question and answer are translated to English before saving."""
     p = store.get_proposal(pid)
     if not p or p["status"] != "pending":
         raise ValueError("This card was not found or is already handled")
@@ -240,13 +277,14 @@ def apply_proposal(pid, mode, feature_id, part, title, audience, body, keywords_
     if kb.resolve() != KB_PATH.resolve():
         raise ValueError("This feature is not set up for review yet")
     audience_text = _audience_text(audience)
+    english_title = _clean_body(_question_to_english(title))
     english = _clean_body(_to_english(body))  # before the KB is touched: a failed translation changes nothing
     with _lock:
         lines = kb.read_text(encoding="utf-8").splitlines()
         if mode == "replace":
-            new_lines, target = edit_chunk(lines, chunk_id, title, audience_text, english), chunk_id
+            new_lines, target = edit_chunk(lines, chunk_id, english_title, audience_text, english), chunk_id
         else:
-            new_lines, target = add_chunk(lines, part, title, audience_text, english)
+            new_lines, target = add_chunk(lines, part, english_title, audience_text, english)
         backup_dir = kb.parent / "kb_backups"
         backup_dir.mkdir(exist_ok=True)
         backup = backup_dir / f"kb_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -263,7 +301,7 @@ def apply_proposal(pid, mode, feature_id, part, title, audience, body, keywords_
         log_info("review", f"Proposal {pid}: {mode} {target} applied, backup {backup.name}")
         store.set_feedback_status(p["feedback_ids"], "merged")
         keywords.add((keywords_text or "").split(","))
-        store.set_proposal_status(pid, "approved", title, audience_text, english, mode, target)
+        store.set_proposal_status(pid, "approved", english_title, audience_text, english, mode, target)
 
 
 def reject_proposal(pid):

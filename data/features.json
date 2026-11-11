@@ -3,7 +3,7 @@
   {
    "id": "tow",
    "name": "Tug of War",
-   "kb_file": "1_support_kb_tow.md",
+   "kb_file": "cust_supp_kb.md",
    "audiences": [
     "Broadcaster",
     "Participant"

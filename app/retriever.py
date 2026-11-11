@@ -34,16 +34,17 @@ class Retriever:
     @staticmethod
     def _allowed(meta, role):
         if role == "broadcaster":
-            return meta["for_broadcaster"]
+            return meta.get("for_broadcaster", True)
         if role == "participant":
-            return meta["for_participant"]
+            return meta.get("for_participant", True)
         return True
 
-    def search(self, query, role=None, top_k=3, n_candidates=10, conv_id=None):
-        """role: 'broadcaster', 'participant' or None (no filter). Returns a list of dicts."""
+    def search(self, query, role=None, top_k=3, n_candidates=10, conv_id=None, query_vector=None):
+        """role: 'broadcaster', 'participant' or None (no filter). Returns a list of dicts.
+        Optional query_vector avoids duplicate embedding calculations when already computed."""
         tag = f"conv={conv_id} " if conv_id else ""
         try:
-            qv = embed([query])[0]
+            qv = query_vector if query_vector is not None else embed([query])[0]
             where = None
             if role == "broadcaster":
                 where = {"for_broadcaster": True}
@@ -74,7 +75,7 @@ class Retriever:
         out = []
         for i in order:
             m = self.metas[self.pos[i]]
-            out.append({"id": i, "title": m["title"], "audience": m["audience"],
+            out.append({"id": i, "title": m["title"], "audience": m.get("audience", "Everyone"),
                         "text": self.docs[self.pos[i]], "dense_sim": dense_sim.get(i),
                         "bm25": bm_score.get(i), "rrf": rrf[i]})
         log_info("search", f"{tag}query='{query[:60]}' role={role} -> {[r['id'] for r in out]}")

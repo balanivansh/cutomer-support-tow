@@ -1,6 +1,6 @@
 """Draft pipeline (LangGraph):
 build_query -> [greeting/vague: clarify | anything else: retrieve]
-retrieve (KB + past replies, no role filter) -> [KB similarity low and no past reply: holding reply | else: draft]
+retrieve (reviewed KB only, no role filter) -> [KB similarity low: holding reply | else: draft]
 Public function: generate_draft(list_of_customer_messages) -> dict. It never sends anything."""
 import os
 import re
@@ -9,7 +9,7 @@ from typing import TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from app.kb_common import log_error, log_info
+from app.kb_common import embed, log_error, log_info
 from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, chat_json
 from app.prompts import build_clarify_messages, build_draft_messages, build_query_messages
 
@@ -44,10 +44,10 @@ def get_retriever():
     return _retriever
 
 
-def get_past_replies(english_query, conv_id=None):
-    """Earlier agent-approved replies for similar questions (empty list if none or on any failure)."""
+def get_past_replies(english_query, conv_id=None, query_vector=None):
+    """Earlier agent-approved replies for similar questions in the same week (empty list if none or on any failure)."""
     from app import past_replies
-    return past_replies.search(english_query, conv_id=conv_id)
+    return past_replies.search(english_query, conv_id=conv_id, query_vector=query_vector)
 
 
 class DraftState(TypedDict, total=False):
@@ -90,7 +90,7 @@ def _add_tokens(state, usage):
 
 
 def n_build_query(state):
-    data, usage, _ = chat_json(build_query_messages(state["thread"]), QUERY_MODEL, 900,
+    data, usage, _ = chat_json(build_query_messages(state["thread"]), QUERY_MODEL, 250,
                                "build_query", state["conv_id"])
     intent = data.get("intent") if data.get("intent") in {"greeting", "vague", "real_question", "off_topic"} \
         else "real_question"
@@ -118,7 +118,7 @@ def n_clarify(state):
     lang = _lang_key(state["query_info"])
     draft, usage = "", {"in": 0, "out": 0}
     try:
-        data, usage, _ = chat_json(build_clarify_messages(state["thread"], LANG_NOTE[lang]), DRAFT_MODEL, 600,
+        data, usage, _ = chat_json(build_clarify_messages(state["thread"], LANG_NOTE[lang]), DRAFT_MODEL, 250,
                                    "clarify", state["conv_id"])
         draft = (data.get("draft") or "").strip().replace("\u202f", " ").replace("\u00a0", " ")
     except LLMError as e:
@@ -129,12 +129,13 @@ def n_clarify(state):
 
 def n_retrieve(state):
     info = state["query_info"]
-    # No role filter: a wrong role guess used to hide the right chunks (e.g. credit chunks are broadcaster-only)
-    chunks = get_retriever().search(info["english_query"], role=None,
-                                    top_k=4 if info["ambiguous"] else 3, conv_id=state["conv_id"])
+    eq = info["english_query"]
+    qv = embed([eq])[0]
+    k = 3 if info["ambiguous"] else 2
+    chunks = get_retriever().search(eq, role=None, top_k=k, conv_id=state["conv_id"], query_vector=qv)
+    past = get_past_replies(eq, conv_id=state["conv_id"], query_vector=qv)
     top = max((c["dense_sim"] for c in chunks if c["dense_sim"] is not None), default=0.0)
-    return {"chunks": chunks, "top_dense": top,
-            "past": get_past_replies(info["english_query"], state["conv_id"])}
+    return {"chunks": chunks, "top_dense": top, "past": past}
 
 
 def route_after_retrieve(state):
@@ -150,18 +151,19 @@ def n_low_sim(state):
 
 def n_draft(state):
     chunks = state["chunks"]
+    past = state.get("past") or []
     msgs = build_draft_messages(state["thread"], [{"id": c["id"], "text": c["text"]} for c in chunks],
-                                state.get("past"), LANG_NOTE[_lang_key(state["query_info"])])
-    data, usage, _ = chat_json(msgs, DRAFT_MODEL, 1800, "draft", state["conv_id"])
+                                past, LANG_NOTE[_lang_key(state["query_info"])])
+    data, usage, _ = chat_json(msgs, DRAFT_MODEL, 300, "draft", state["conv_id"])
     status = data.get("status")
     draft = (data.get("draft") or "").strip().replace("\u2011", "-").replace("\u2010", "-") \
         .replace("\u202f", " ").replace("\u00a0", " ")
     lang = _lang_key(state["query_info"])
     if status not in STATUSES or not draft:
         log_error("LLM_ERROR", "draft", f"conv={state['conv_id']} Draft answer had status={status!r} and "
-                  f"{'an empty' if not draft else 'a'} draft. Using the safe holding reply.")
+                   f"{'an empty' if not draft else 'a'} draft. Using the safe holding reply.")
         status, draft = "NOT_IN_KB", HOLD_TEXT[lang]
-    ids = {c["id"] for c in chunks} | {p["id"] for p in (state.get("past") or [])}
+    ids = {c["id"] for c in chunks} | {p["id"] for p in past}
     used = [u for u in (data.get("used") or []) if u in ids]
     log_info("draft", f"conv={state['conv_id']} status={status} used={used}")
     return {"result": {"status": status, "draft": draft, "used": used},

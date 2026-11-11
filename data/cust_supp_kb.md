@@ -96,6 +96,10 @@ Your Health Heart and weekly free credits follow a weekly cycle:
 A recording can be rejected in the weekend review for offensive content, copyright strikes, or silent or fake singing. Rejected recordings, poor audio or video quality, and inactivity pull your Health Heart down toward Yellow or Red, which means fewer free credits on Monday (see B5).
 To recover: post clear, high-quality, compliant singing recordings, avoid background noise, blank screens and non-musical broadcasts, make sure none of your recordings is marked "Rejected", and stay active from Monday to Saturday.
 
+### B15. Broadcaster: I recorded {a number<21} and applied the recommendation, yet Heart Health is still Red.
+**Audience:** Broadcaster
+Each Tug of War must be recorded and at least 21 recordings are required each week. Create a video this week; if the video is correct, it will be approved the following week.
+
 ---
 
 ## PART C: PARTICIPANT
@@ -174,3 +178,11 @@ Ranks users by total coins won this calendar month and shows total match wins. R
 
 ---
 
+
+---
+
+## PART E: LIVE APPROVAL
+
+### E1. Why is Tug and pk not showing to me?
+**Audience:** Everyone
+your account may be in the live audition period. To obtain final live approval, post a video recording from your live session. Final live approval will be granted within 24–48 hours based on your video recording.

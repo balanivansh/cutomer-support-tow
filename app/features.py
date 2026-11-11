@@ -82,3 +82,24 @@ def add_audience(fid, name):
             auds.append(name)
             _save(items)
         return list(auds)
+
+
+def add_feature(name, kb_file=None, audiences=None):
+    """Add a new feature to features.json."""
+    name = " ".join((name or "").strip().split())
+    if not name:
+        raise ValueError("Feature name cannot be empty")
+    fid = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    with _lock:
+        items = load()
+        if any(f["id"] == fid or f["name"].lower() == name.lower() for f in items):
+            raise ValueError(f"Feature '{name}' already exists")
+        new_f = {
+            "id": fid,
+            "name": name,
+            "kb_file": kb_file or KB_PATH.name,
+            "audiences": audiences or ["Broadcaster", "Participant"]
+        }
+        items.append(new_f)
+        _save(items)
+        return new_f

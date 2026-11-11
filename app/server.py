@@ -1,8 +1,7 @@
-"""FastAPI server: serves the two-pane page, collects customer messages, waits for a quiet period,
-then drafts a reply. Nothing is ever sent to a customer automatically; the agent presses Send.
+"""FastAPI server: serves the two-pane page, stores customer messages, and drafts only when
+the support agent explicitly requests Generate. Nothing is sent automatically.
 Run from the project root:  uvicorn app.server:app --port 8000"""
 import asyncio
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,19 +9,18 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app import features, past_replies, review, store
+from app import features, review, store
 from app.kb_common import log_error, log_info
 from app.llm import QUERY_MODEL, LLMError, chat_json
 from app.pipeline import generate_draft, get_retriever
 
-DEBOUNCE = float(os.getenv("DEBOUNCE_SECONDS") or 4)
 MAX_TEXT = 2000
 INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 REVIEW_HTML = Path(__file__).parent / "static" / "review.html"
 
-_state = {}  # conv_id -> {"version": int, "task": asyncio.Task | None, "pending": bool}
 _sockets = {}  # conv_id -> set of open WebSockets
-_gate = asyncio.Semaphore(2)  # at most 2 drafts at once (Groq free tier is token-limited)
+_generating = set()
+_gate = asyncio.Semaphore(2)  # local protection; replace with a shared queue before multi-instance deployment
 
 
 def _warm_up():
@@ -52,12 +50,8 @@ class Send(BaseModel):
     draft_id: int | None = None
 
 
-def _st(cid):
-    return _state.setdefault(cid, {"version": 0, "task": None, "pending": False})
-
-
 def _snapshot(cid):
-    return {"messages": store.list_messages(cid), "pending": _st(cid)["pending"],
+    return {"messages": store.list_messages(cid), "pending": cid in _generating,
             "draft": store.latest_draft(cid)}
 
 
@@ -74,41 +68,6 @@ async def _push(cid):
 def _require(cid):
     if not store.conversation_exists(cid):
         raise HTTPException(404, "Conversation not found")
-
-
-async def _draft_after_quiet(cid, version):
-    s = _st(cid)
-    try:
-        await asyncio.sleep(DEBOUNCE)
-        texts = store.unanswered_customer_texts(cid)
-        if not texts:
-            s["pending"] = False
-            await _push(cid)
-            return
-        async with _gate:
-            result = await asyncio.to_thread(generate_draft, texts, cid)
-        if s["version"] != version:
-            log_info("aggregator", f"conv={cid} Discarding late draft (a newer message or a reply arrived)")
-            return
-        store.save_draft(cid, version, result)
-        s["pending"] = False
-        log_info("aggregator", f"conv={cid} Draft saved: status={result.get('status')} for {len(texts)} message(s)")
-        await _push(cid)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        s["pending"] = False
-        log_error("API_ERROR", "aggregator", f"conv={cid} Drafting task failed", e)
-        await _push(cid)
-
-
-def _schedule(cid):
-    s = _st(cid)
-    s["version"] += 1
-    s["pending"] = True
-    if s["task"] and not s["task"].done():
-        s["task"].cancel()
-    s["task"] = asyncio.create_task(_draft_after_quiet(cid, s["version"]))
 
 
 @app.get("/")
@@ -128,9 +87,36 @@ async def customer_message(cid: str, body: Text):
     if not text:
         raise HTTPException(400, "Empty message")
     store.add_message(cid, "customer", text[:MAX_TEXT])
-    _schedule(cid)
     await _push(cid)
     return {"ok": True}
+
+
+@app.post("/api/conversations/{cid}/drafts")
+async def generate(cid: str):
+    """Generate one agent-requested draft from bounded context for this conversation."""
+    _require(cid)
+    if cid in _generating:
+        raise HTTPException(409, "A draft is already being generated")
+    context = store.generation_context(cid)
+    last_agent = max((n for n, m in enumerate(context) if m["sender"] == "agent"), default=-1)
+    if not context or not any(m["sender"] == "customer" for m in context[last_agent + 1:]):
+        raise HTTPException(409, "There are no recent customer messages to answer")
+    _generating.add(cid)
+    await _push(cid)
+    try:
+        # Sender labels let the model resolve short customer follow-ups against recent agent replies.
+        messages = [f"{m['sender'].title()}: {m['text']}" for m in context]
+        async with _gate:
+            result = await asyncio.to_thread(generate_draft, messages, cid)
+        draft_id = store.save_draft(cid, result, context)
+        log_info("generate", f"conv={cid} draft={draft_id} status={result.get('status')} context={[m['id'] for m in context]}")
+        return {"draft_id": draft_id, "status": result.get("status"), "latest_message_id": context[-1]["id"]}
+    except Exception as e:
+        log_error("API_ERROR", "generate", f"conv={cid} Draft generation failed", e)
+        raise HTTPException(500, "Draft generation failed")
+    finally:
+        _generating.discard(cid)
+        await _push(cid)
 
 
 @app.get("/api/conversations/{cid}/state")
@@ -164,19 +150,16 @@ async def send(cid: str, body: Send):
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "Empty reply")
-    customer_text = "\n".join(store.unanswered_customer_texts(cid))
+    if body.draft_id and store.draft_has_new_customer_message(cid, body.draft_id):
+        raise HTTPException(409, "A newer customer message arrived. Generate a fresh draft before sending.")
+    customer_text = "\n".join(m["text"] for m in store.generation_context(cid) if m["sender"] == "customer")
     store.add_message(cid, "agent", text[:MAX_TEXT])
-    outcome = store.save_feedback(cid, body.draft_id, customer_text, text[:MAX_TEXT])
-    store.mark_answered(cid)
+    store.mark_answered(cid, body.draft_id)
     try:
+        from app import past_replies
         await asyncio.to_thread(past_replies.index_pending)
     except Exception as e:
         log_error("RETRIEVAL_ERROR", "past_index", f"conv={cid} Indexing the sent reply failed", e)
-    s = _st(cid)
-    s["version"] += 1  # any draft still being written is now late
-    s["pending"] = False
-    if s["task"] and not s["task"].done():
-        s["task"].cancel()
     await _push(cid)
     return {"outcome": outcome}
 
@@ -204,6 +187,18 @@ async def review_page():
 async def features_list():
     return [{"id": f["id"], "name": f["name"], "audiences": f.get("audiences", []), "topics": features.topics(f)}
             for f in features.load()]
+
+
+class NewFeature(BaseModel):
+    name: str
+
+
+@app.post("/api/features")
+async def features_add(b: NewFeature):
+    try:
+        return features.add_feature(b.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/features/{fid}/audience")

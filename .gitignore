@@ -22,6 +22,8 @@ data/chroma/
 
 # ─── SQLite database ──────────────────────────────────────────────────────────
 data/*.db
+data/kb_backups/
+data/eval_results.json
 
 # ─── macOS ────────────────────────────────────────────────────────────────────
 .DS_Store

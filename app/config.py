@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # ── Paths ────────────────────────────────────────────────────────────────
     CHROMA_PATH: str = "./data/chroma"
     SQLITE_PATH: str = "./data/app.db"
-    KB_PATH: str = "./data/1_support_kb_tow.md"
+    KB_PATH: str = "./data/cust_supp_kb.md"
 
     # ── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

@@ -25,9 +25,6 @@ button:disabled{opacity:.5;cursor:default}
 button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .draftbox{padding:10px 14px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px;overflow:auto;max-height:62%}
 .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--mute);font-size:13px}
-#newsug{background:#fff4d6;border-color:#e3c15a;color:#5c4400}
-#meta,#preview{white-space:pre-wrap;font-size:13px;color:var(--mute);border:1px dashed var(--line);border-radius:6px;padding:8px}
-#preview{color:var(--ink)}
 #err{color:#c0362c;font-size:13px;padding:0 14px 8px}
 [hidden]{display:none!important}
 @media (max-width:800px){body{grid-template-columns:1fr;height:auto}.pane{height:70vh}}
@@ -47,16 +44,11 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
   <div class="head"><span>Support agent</span><span id="pending" class="bar"></span></div>
   <div class="msgs" id="agentmsgs"></div>
   <div class="draftbox">
-    <button id="newsug" hidden>New suggestion available. Replace my text</button>
     <textarea id="draft" placeholder="Draft reply appears here. Edit it, then send." aria-label="Draft reply"></textarea>
     <div class="bar">
-      <label><input type="checkbox" id="engtoggle"> English preview</label>
-      <button id="engrefresh" hidden>Refresh preview</button>
       <span id="outcome"></span>
     </div>
-    <div id="preview" hidden></div>
-    <div id="meta" hidden></div>
-    <div><button class="primary" id="agentsend">Send reply</button></div>
+    <div><button class="primary" id="generate">Generate draft</button> <button class="primary" id="agentsend">Send reply</button></div>
   </div>
   <div id="err"></div>
 </section>
@@ -64,8 +56,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 <script>
 const $ = id => document.getElementById(id);
 let convId = localStorage.getItem('conv');
-let lastKey = '', loadedText = '', loadedDraftId = null, suggestion = null;
-const previewCache = {};
+let lastKey = '', loadedText = '', loadedDraftId = null;
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -78,8 +69,8 @@ const showErr = m => { $('err').textContent = m || ''; };
 async function newChat() {
   const r = await post('/api/conversations');
   convId = r.id; localStorage.setItem('conv', convId);
-  lastKey = ''; loadedText = ''; loadedDraftId = null; suggestion = null;
-  $('draft').value = ''; $('newsug').hidden = true; $('meta').hidden = true; $('preview').hidden = true;
+  lastKey = ''; loadedText = ''; loadedDraftId = null;
+  $('draft').value = '';
   $('outcome').textContent = ''; $('custmsgs').innerHTML = ''; $('agentmsgs').innerHTML = '';
 }
 
@@ -97,39 +88,20 @@ function renderMsgs(el, msgs, me) {
   el.scrollTop = el.scrollHeight;
 }
 
-function metaText(d) {
-  const q = d.query || {}, t = d.tokens || {};
-  const fmt = v => typeof v === 'number' ? v.toFixed(2) : '-';
-  const lines = [
-    'Status: ' + d.status + (d.error ? ' (' + d.error + ')' : ''),
-    'Used: ' + ((d.used || []).join(', ') || 'none'),
-    'Retrieved: ' + ((d.sources || []).map(s => s.id + ' ' + fmt(s.dense_sim)).join(', ') || 'none'),
-    'Intent: ' + (q.intent || '-') + ' | Role: ' + (q.role_guess || '-') + ' | Language: ' + (q.language_and_script || '-'),
-    'English query: ' + (q.english_query || '-'),
-    'Tokens in/out: ' + (t.in ?? '-') + '/' + (t.out ?? '-') + ' | ' + (d.ms ?? '-') + ' ms'
-  ];
-  return lines.join('\n');
-}
-
 function applyDraft(d) {
   $('draft').value = d.draft || '';
-  loadedText = $('draft').value; loadedDraftId = d.id; suggestion = null;
-  $('newsug').hidden = true;
-  $('meta').textContent = metaText(d); $('meta').hidden = false;
-  if ($('engtoggle').checked) preview(false);
+  loadedText = $('draft').value; loadedDraftId = d.id;
 }
 
 function handleDraft(s) {
   $('pending').textContent = s.pending ? 'Drafting…' : '';
   const d = s.draft, dirty = $('draft').value !== loadedText;
   if (!d) {
-    suggestion = null; $('newsug').hidden = true;
-    if (!dirty) { $('draft').value = ''; loadedText = ''; loadedDraftId = null; $('meta').hidden = true; }
+    if (!dirty) { $('draft').value = ''; loadedText = ''; loadedDraftId = null; }
     return;
   }
   if (d.id === loadedDraftId) return;
   if (!dirty) applyDraft(d);
-  else { suggestion = d; $('newsug').hidden = false; }
 }
 
 function render(s) {
@@ -172,35 +144,27 @@ async function agentSend() {
   try {
     const r = await post('/api/conversations/' + convId + '/send', {text, draft_id: loadedDraftId});
     $('outcome').textContent = 'Sent (' + r.outcome + ')';
-    $('draft').value = ''; loadedText = ''; loadedDraftId = null; suggestion = null;
-    $('newsug').hidden = true; $('meta').hidden = true; $('preview').hidden = true; $('engtoggle').checked = false;
-    $('engrefresh').hidden = true;
+    $('draft').value = ''; loadedText = ''; loadedDraftId = null;
   } catch (e) { showErr('Reply not sent: ' + e.message); }
   $('agentsend').disabled = false;
 }
 
-async function preview(force) {
-  const text = $('draft').value.trim(), box = $('preview');
-  box.hidden = false;
-  if (!text) { box.textContent = 'Nothing to translate.'; return; }
-  if (!force && previewCache[text]) { box.textContent = previewCache[text]; return; }
-  box.textContent = 'Translating…';
+async function generate() {
+  if (!convId) return;
+  $('generate').disabled = true;
+  $('outcome').textContent = '';
   try {
-    const r = await post('/api/translate', {text});
-    previewCache[text] = r.english; box.textContent = r.english;
-  } catch (e) { box.textContent = 'Preview failed: ' + e.message; }
+    await post('/api/conversations/' + convId + '/drafts');
+    render(await api('/api/conversations/' + convId + '/state'));
+  } catch (e) { showErr('Draft not generated: ' + e.message); }
+  $('generate').disabled = false;
 }
 
 $('newchat').onclick = async () => { await newChat(); connect(); };
 $('custsend').onclick = customerSend;
 $('custin').addEventListener('keydown', e => { if (e.key === 'Enter') customerSend(); });
 $('agentsend').onclick = agentSend;
-$('newsug').onclick = () => { if (suggestion) applyDraft(suggestion); };
-$('engtoggle').onchange = e => {
-  $('engrefresh').hidden = !e.target.checked;
-  if (e.target.checked) preview(false); else $('preview').hidden = true;
-};
-$('engrefresh').onclick = () => preview(true);
+$('generate').onclick = generate;
 
 (async () => { if (!convId) await newChat(); connect(); })();
 </script>

@@ -27,6 +27,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .row2>div{flex:1}
 .chk{display:inline-flex;align-items:center;margin:0 14px 6px 0;cursor:pointer}
 .small{max-width:460px}
+.small-btn{font-size:12px;padding:2px 8px;margin-left:6px;border-radius:4px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -67,8 +68,33 @@ function card(p) {
   const fsel = el('select'), tsel = el('select');
   FEATURES.forEach(f => { const o = el('option', '', f.name); o.value = f.id; fsel.append(o); });
   fsel.value = x.feature_id || '';
-  fw.append(el('div', 'mute', 'Feature'), fsel);
-  tw.append(el('div', 'mute', 'Topic'), tsel);
+  const addFeatBtn = el('button', 'small-btn', '+ Add feature');
+  addFeatBtn.type = 'button';
+  addFeatBtn.onclick = async () => {
+    const name = (prompt('Enter new feature name (e.g. PK, Live Stream):') || '').trim();
+    if (!name) return;
+    try {
+      const nf = await post('/api/features', {name});
+      FEATURES.push(nf);
+      const opt = el('option', '', nf.name); opt.value = nf.id;
+      fsel.append(opt); fsel.value = nf.id;
+      drawTopics();
+    } catch (e) { alert('Could not add feature: ' + e.message); }
+  };
+  const fHeader = el('div', 'mute', 'Feature '); fHeader.append(addFeatBtn);
+  fw.append(fHeader, fsel);
+
+  const addTopicBtn = el('button', 'small-btn', '+ Add topic/part');
+  addTopicBtn.type = 'button';
+  addTopicBtn.onclick = () => {
+    const tname = (prompt('Enter new topic or section title (e.g. Live approval, Stream setup):') || '').trim();
+    if (!tname) return;
+    const opt = el('option', '', tname); opt.value = tname;
+    tsel.append(opt); tsel.value = tname;
+  };
+  const tHeader = el('div', 'mute', 'Topic / Section '); tHeader.append(addTopicBtn);
+  tw.append(tHeader, tsel);
+
   row.append(fw, tw);
   c.append(row);
   const feat = () => FEATURES.find(f => f.id === fsel.value);
@@ -79,12 +105,17 @@ function card(p) {
     const want = fsel.value === x.feature_id ? (p.part || '') : '';
     tsel.value = [...tsel.options].some(o => o.value === want) ? want : '';
   };
+  fsel.onchange = drawTopics;
+  drawTopics();
 
-  c.append(el('div', 'mute', 'Question (English)'));
+  c.append(el('div', 'mute', 'Question in English (KB heading & search)'));
   const question = el('input'); question.value = p.title || ''; c.append(question);
+  const qNotice = el('div', 'mute', 'ℹ️ Note: Auto-translated & cleaned into English for KB heading upon saving.');
+  qNotice.style.fontSize = '12px'; qNotice.style.marginTop = '2px'; qNotice.style.marginBottom = '8px';
+  c.append(qNotice);
 
-  // audience: nothing ticked = Everyone
-  c.append(el('div', 'mute', 'Audience'));
+  // audience: multi-select checkboxes (Everyone clears others; specific checkboxes can be combined)
+  c.append(el('div', 'mute', 'Audience (Multi-select)'));
   const audBox = el('div'); c.append(audBox);
   let selected = parseAud(p.audience);
   const msg = el('div', 'err');
@@ -96,9 +127,17 @@ function card(p) {
       l.append(i, label); return l;
     };
     audBox.append(mk('Everyone', !selected.length, v => { if (v) selected = []; drawAud(); }));
-    [...new Set([...((feat() || {}).audiences || []), ...selected])].forEach(a =>
-      audBox.append(mk(a, selected.includes(a), v => { selected = v ? [...selected, a] : selected.filter(s => s !== a); drawAud(); })));
-    const addA = el('button', '', '+ Add audience');
+    [...new Set([...((feat() || {}).audiences || ['Broadcaster', 'Participant']), ...selected])].forEach(a =>
+      audBox.append(mk(a, selected.includes(a), v => {
+        if (v) {
+          selected = [...selected.filter(s => s !== a), a];
+        } else {
+          selected = selected.filter(s => s !== a);
+        }
+        drawAud();
+      })));
+    const addA = el('button', 'small-btn', '+ Add audience');
+    addA.type = 'button';
     addA.onclick = async () => {
       const f = feat(); const name = (prompt('New audience name') || '').trim();
       if (!f || !name) return;
@@ -112,6 +151,7 @@ function card(p) {
     };
     audBox.append(addA);
   };
+  drawAud();
 
   c.append(el('div', 'mute', 'Answer (edit if needed)'));
   const body = el('textarea'); body.value = p.body || ''; c.append(body);
