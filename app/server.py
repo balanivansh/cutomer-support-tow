@@ -1,24 +1,25 @@
-"""FastAPI server: serves the two-pane page, stores customer messages, and drafts only when
-the support agent explicitly requests Generate. Nothing is sent automatically.
+"""FastAPI server for the Support Agent Web Portal: drafts only when the support agent explicitly
+requests Generate. Nothing is sent automatically.
 Run from the project root:  uvicorn app.server:app --port 8000"""
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import features, review, store
 from app.kb_common import log_error, log_info
-from app.llm import QUERY_MODEL, LLMError, chat_json
+from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, chat_json
 from app.pipeline import generate_draft, get_retriever
 
 MAX_TEXT = 2000
-INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 REVIEW_HTML = Path(__file__).parent / "static" / "review.html"
 
-_sockets = {}  # conv_id -> set of open WebSockets
 _generating = set()
 _gate = asyncio.Semaphore(2)  # local protection; replace with a shared queue before multi-instance deployment
 
@@ -40,127 +41,79 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 
+# Dev: allow the Lovable agent portal (any origin). Tighten allow_origins to the real portal URLs before production.
+# We send no cookies (auth is the company token), so allow_credentials stays False, which is what makes "*" valid.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+                   allow_credentials=False)
+
 
 class Text(BaseModel):
     text: str
 
 
-class Send(BaseModel):
+class Msg(BaseModel):
+    sender: Literal["customer", "agent"]
     text: str
-    draft_id: int | None = None
 
 
-def _snapshot(cid):
-    return {"messages": store.list_messages(cid), "pending": cid in _generating,
-            "draft": store.latest_draft(cid)}
+class DraftRequest(BaseModel):
+    chat_id: int  # rox-chat chat.id, used only as a label and a per-chat lock
+    latest_message_id: int  # rox-chat chat_message.id of the newest message sent in `messages`
+    messages: list[Msg] = Field(min_length=1, max_length=50)  # oldest first
+    agent_user_id: int  # REQUIRED: who clicked Generate (the logged-in userId). No silent default.
+    customer_user_id: int | None = None  # the customer who sent the message (profile id), for the audit row
 
 
-async def _push(cid):
-    """Send the current state to every browser watching this conversation."""
-    snap = _snapshot(cid)
-    for ws in list(_sockets.get(cid, ())):
-        try:
-            await ws.send_json(snap)
-        except Exception:
-            _sockets.get(cid, set()).discard(ws)
+class FeedbackRequest(BaseModel):
+    draft_id: int  # the id returned by /api/draft
+    final_text: str  # what the agent really sent
+    customer_text: str = ""
+    sent_message_id: int | None = None  # chat_message.id of the sent reply, if the portal knows it
 
 
-def _require(cid):
-    if not store.conversation_exists(cid):
-        raise HTTPException(404, "Conversation not found")
-
-
-@app.get("/")
-async def index():
-    return FileResponse(INDEX_HTML)
-
-
-@app.post("/api/conversations")
-async def new_conversation():
-    return {"id": store.create_conversation()}
-
-
-@app.post("/api/conversations/{cid}/customer")
-async def customer_message(cid: str, body: Text):
-    _require(cid)
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(400, "Empty message")
-    store.add_message(cid, "customer", text[:MAX_TEXT])
-    await _push(cid)
-    return {"ok": True}
-
-
-@app.post("/api/conversations/{cid}/drafts")
-async def generate(cid: str):
-    """Generate one agent-requested draft from bounded context for this conversation."""
-    _require(cid)
-    if cid in _generating:
-        raise HTTPException(409, "A draft is already being generated")
-    context = store.generation_context(cid)
+@app.post("/api/draft")
+async def api_draft(body: DraftRequest):
+    """Stateless draft: rox-chat sends the recent messages, gets the draft text back in one call."""
+    cid = f"chat-{body.chat_id}"
+    items = [{"sender": m.sender, "text": m.text.strip()[:MAX_TEXT]} for m in body.messages if m.text.strip()]
+    context = store.bound_context(items)
     last_agent = max((n for n, m in enumerate(context) if m["sender"] == "agent"), default=-1)
-    if not context or not any(m["sender"] == "customer" for m in context[last_agent + 1:]):
+    if not any(m["sender"] == "customer" for m in context[last_agent + 1:]):
         raise HTTPException(409, "There are no recent customer messages to answer")
+    if store.message_has_draft(body.chat_id, body.latest_message_id):
+        raise HTTPException(409, "A draft already exists for this customer message. Edit it instead")
+    if cid in _generating:
+        raise HTTPException(409, "A draft is already being generated for this chat")
     _generating.add(cid)
-    await _push(cid)
     try:
-        # Sender labels let the model resolve short customer follow-ups against recent agent replies.
-        messages = [f"{m['sender'].title()}: {m['text']}" for m in context]
+        lines = [f"{m['sender'].title()}: {m['text']}" for m in context]
         async with _gate:
-            result = await asyncio.to_thread(generate_draft, messages, cid)
-        draft_id = store.save_draft(cid, result, context)
-        log_info("generate", f"conv={cid} draft={draft_id} status={result.get('status')} context={[m['id'] for m in context]}")
-        return {"draft_id": draft_id, "status": result.get("status"), "latest_message_id": context[-1]["id"]}
+            result = await asyncio.to_thread(generate_draft, lines, cid)
+        draft_id = store.save_draft(body.chat_id, result, body.latest_message_id, body.agent_user_id,
+                                    body.customer_user_id, DRAFT_MODEL)
+        log_info("api_draft", f"chat={body.chat_id} draft={draft_id} status={result.get('status')} "
+                              f"agent={body.agent_user_id} customer={body.customer_user_id}")
+        return {"draft_id": draft_id, "status": result.get("status"), "draft": result.get("draft", ""),
+                "used": result.get("used") or [], "ms": result.get("ms")}
+    except store.DraftExists:
+        raise HTTPException(409, "A draft already exists for this customer message. Edit it instead")
     except Exception as e:
-        log_error("API_ERROR", "generate", f"conv={cid} Draft generation failed", e)
+        log_error("API_ERROR", "api_draft", f"chat={body.chat_id} Draft generation failed", e)
         raise HTTPException(500, "Draft generation failed")
     finally:
         _generating.discard(cid)
-        await _push(cid)
 
 
-@app.get("/api/conversations/{cid}/state")
-async def state(cid: str):
-    _require(cid)
-    return _snapshot(cid)
-
-
-@app.websocket("/ws/{cid}")
-async def ws_endpoint(ws: WebSocket, cid: str):
-    if not store.conversation_exists(cid):
-        await ws.close(code=4404)
-        return
-    await ws.accept()
-    _sockets.setdefault(cid, set()).add(ws)
-    log_info("websocket", f"conv={cid} browser connected")
-    try:
-        await ws.send_json(_snapshot(cid))
-        while True:
-            await ws.receive_text()  # we only push; this just detects disconnects
-    except WebSocketDisconnect:
-        pass
-    finally:
-        _sockets.get(cid, set()).discard(ws)
-        log_info("websocket", f"conv={cid} browser disconnected")
-
-
-@app.post("/api/conversations/{cid}/send")
-async def send(cid: str, body: Send):
-    _require(cid)
-    text = body.text.strip()
-    if not text:
+@app.post("/api/feedback")
+async def api_feedback(body: FeedbackRequest):
+    """Stateless outcome: compares the sent reply with the saved draft and feeds the weekly review."""
+    final = body.final_text.strip()
+    if not final:
         raise HTTPException(400, "Empty reply")
-    if body.draft_id and store.draft_has_new_customer_message(cid, body.draft_id):
-        raise HTTPException(409, "A newer customer message arrived. Generate a fresh draft before sending.")
-    customer_text = "\n".join(m["text"] for m in store.generation_context(cid) if m["sender"] == "customer")
-    store.add_message(cid, "agent", text[:MAX_TEXT])
-    store.mark_answered(cid, body.draft_id)
-    try:
-        from app import past_replies
-        await asyncio.to_thread(past_replies.index_pending)
-    except Exception as e:
-        log_error("RETRIEVAL_ERROR", "past_index", f"conv={cid} Indexing the sent reply failed", e)
-    await _push(cid)
+    if not store.draft_exists(body.draft_id):
+        raise HTTPException(404, "Draft not found")
+    outcome = store.save_feedback(body.draft_id, body.customer_text[:MAX_TEXT], final[:MAX_TEXT],
+                                  body.sent_message_id)
     return {"outcome": outcome}
 
 
@@ -183,10 +136,14 @@ async def review_page():
     return FileResponse(REVIEW_HTML)
 
 
+def _feature_json(f):
+    """One shape for GET and POST, so the page can use the POST result directly."""
+    return {"id": f["id"], "name": f["name"], "audiences": f.get("audiences", []), "topics": features.topics(f)}
+
+
 @app.get("/api/features")
 async def features_list():
-    return [{"id": f["id"], "name": f["name"], "audiences": f.get("audiences", []), "topics": features.topics(f)}
-            for f in features.load()]
+    return [_feature_json(f) for f in features.load()]
 
 
 class NewFeature(BaseModel):
@@ -196,7 +153,7 @@ class NewFeature(BaseModel):
 @app.post("/api/features")
 async def features_add(b: NewFeature):
     try:
-        return features.add_feature(b.name)
+        return _feature_json(features.add_feature(b.name))
     except ValueError as e:
         raise HTTPException(400, str(e))
 

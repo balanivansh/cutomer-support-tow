@@ -8,6 +8,15 @@
     "Broadcaster",
     "Participant"
    ]
+  },
+  {
+   "id": "party_room",
+   "name": "Party Room",
+   "kb_file": "cust_supp_kb.md",
+   "audiences": [
+    "Broadcaster",
+    "Participant"
+   ]
   }
  ]
 }

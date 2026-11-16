@@ -8,20 +8,19 @@ QUERY_SYSTEM_PROMPT = """RoxStar support parser. JSON only:
 4. vague: greeting/help with no issue. off_topic: not RoxStar."""
 
 DRAFT_SYSTEM_PROMPT = """You write a DRAFT reply for a RoxStar support agent.
-FACTS: Use ONLY the KB chunks and PAST REPLIES below. Past replies win over KB chunks if they match the question. Never invent rules, timelines, numbers, or promises. Never promise manual account changes.
-STYLE:
-- Match customer language & script (Roman Hinglish -> Roman Hinglish; Devanagari -> Devanagari; English -> clean English).
-- 1-3 short, respectful, calm sentences. Address customer as "Aap". At most one emoji (😊 👍 ✅ ⚠️).
+LANGUAGE (highest priority): write the draft in the language on the "REPLY LANGUAGE" line at the end. Follow it exactly, even if the KB chunks, agent messages or examples are in another language (translate the KB facts). Never mix languages.
+FACTS: Use ONLY the KB chunks and PAST REPLIES below. Past replies win over KB chunks if they match the question. Never invent rules, timelines, numbers, options, steps or promises. Never promise manual account changes. Never treat two different features as the same thing.
+STYLE: 1-3 short, respectful, calm sentences. In Hinglish or Hindi address the customer as "Aap"; in English say "you". At most one emoji (😊 👍 ✅ ⚠️).
 STATUS (choose one):
-- ANSWERED: KB or past reply answers the question.
-- CLARIFY: Question ambiguous or missing details. Ask 1 short friendly question naming related options.
-- NOT_IN_KB: Not answered in KB/past replies. Use polite holding reply in customer's language (e.g. "Hum check karke aapko update karte hain, report karne ke liye thank you."). No facts.
+- ANSWERED: KB or past reply answers the question. If the customer asked several things and the KB covers only some, answer the covered part from the KB and add that you will check the rest. State no facts about the uncovered part.
+- CLARIFY: Question ambiguous or missing details. Answer any part the KB covers, then ask ONE short friendly question about the customer's own situation (what they see or tried). Do NOT list or name options, menus, features or steps unless they appear in the KB chunks.
+- NOT_IN_KB: Not answered in KB/past replies. Use a polite holding reply in the REPLY LANGUAGE, e.g. English: "Let me check and get back to you, thank you for reporting." / Hinglish: "Hum check karke aapko update karte hain, report karne ke liye thank you." / Hindi: "हम जाँच करके आपको अपडेट करते हैं, रिपोर्ट करने के लिए धन्यवाद।" No facts.
 Reply JSON only: {"status": "ANSWERED|CLARIFY|NOT_IN_KB", "draft": "...", "used": ["chunk_or_past_ids"]}"""
 
 
 def build_query_messages(thread_text):
     return [{"role": "system", "content": QUERY_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Customer messages (oldest first):\n{thread_text}"}]
+            {"role": "user", "content": f"Customer messages (oldest first):\n{thread_text}\n\nFor language_and_script look ONLY at the last Customer line; ignore Agent lines and older messages."}]
 
 
 def build_draft_messages(thread_text, kb_chunks, past_replies=None, language_note=""):

@@ -1,40 +1,68 @@
-"""SQLite store: conversations, messages, drafts and review candidates.
+"""SQLite store (temporary home for engine state until it moves to Aurora MySQL).
+
+Two tables only (see rox-chat/docs/architecture.md for why each column exists):
+  chat_support_drafts       one row = one Generate + its Send
+  support_review_proposals  Weekly Review cards and history
 
 Sent replies are recorded for the weekly review, but are never automatically
 used as knowledge for a later customer draft.
 """
 import difflib
+import hashlib
 import json
 import os
 import sqlite3
-import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from app.kb_common import log_error, log_info
+from app.kb_common import KB_PATH, log_error, log_info
 
 DB_PATH = os.getenv("SQLITE_PATH") or "./data/app.db"
 EDITED_MIN_SIMILARITY = 0.5  # final reply this similar to the draft = "edited", below = "rewritten"
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT NOT NULL, sender TEXT NOT NULL,
-  text TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS drafts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT NOT NULL, version INTEGER NOT NULL,
-  status TEXT NOT NULL, draft TEXT NOT NULL, used TEXT, sources TEXT, query TEXT, tokens TEXT,
-  ms INTEGER, error TEXT, context_ids TEXT NOT NULL DEFAULT '[]', context_last_message_id INTEGER,
-  answered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS feedback (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id TEXT NOT NULL, draft_id INTEGER,
-  customer_text TEXT, draft_text TEXT, final_text TEXT NOT NULL, outcome TEXT NOT NULL,
-  indexed INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS proposals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'pending', action TEXT NOT NULL,
-  chunk_id TEXT, part TEXT, title TEXT, audience TEXT, body TEXT, old_text TEXT, reason TEXT,
-  keywords TEXT, feedback_ids TEXT, examples TEXT, candidates TEXT, extra TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_support_drafts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  agent_user_id INTEGER NOT NULL,
+  customer_user_id INTEGER,
+  status TEXT NOT NULL,
+  draft_text TEXT NOT NULL DEFAULT '',
+  final_text TEXT,
+  customer_text TEXT,
+  outcome TEXT NOT NULL DEFAULT 'pending',
+  latest_message_id INTEGER,
+  sent_message_id INTEGER,
+  used_chunks TEXT,
+  sources TEXT,
+  query_json TEXT,
+  error TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  ms INTEGER,
+  llm_model TEXT,
+  kb_version TEXT,
+  review_state INTEGER NOT NULL DEFAULT 0,
+  review_status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  sent_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_drafts_chat_msg ON chat_support_drafts (chat_id, latest_message_id);
+CREATE INDEX IF NOT EXISTS ix_drafts_outcome ON chat_support_drafts (outcome);
+CREATE INDEX IF NOT EXISTS ix_drafts_review ON chat_support_drafts (review_state, review_status);
+CREATE TABLE IF NOT EXISTS support_review_proposals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  action TEXT NOT NULL,
+  chunk_id TEXT, part TEXT, title TEXT, audience TEXT, body TEXT, old_text TEXT,
+  keywords TEXT, draft_ids TEXT, examples TEXT, extra TEXT,
+  created_at TEXT NOT NULL,
+  decided_by INTEGER,
+  decided_at TEXT);
 """
+
+
+class DraftExists(Exception):
+    """This customer message already has a draft. There is no regenerate: the agent edits the draft."""
 
 
 def _now():
@@ -60,82 +88,21 @@ def init_db():
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     with _db() as c:
         c.executescript(SCHEMA)
-        try:  # older databases: add the status column (active / merged / rejected)
-            c.execute("ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-        except sqlite3.OperationalError:
-            pass
-        try:  # older databases: proposals get a candidates column
-            c.execute("ALTER TABLE proposals ADD COLUMN candidates TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:  # older databases: proposals get an extra column (feature, stored point, suggested question)
-            c.execute("ALTER TABLE proposals ADD COLUMN extra TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE drafts ADD COLUMN context_ids TEXT NOT NULL DEFAULT '[]'")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE drafts ADD COLUMN context_last_message_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
     log_info("init_db", f"SQLite ready at {DB_PATH}")
 
 
-def create_conversation():
-    cid = uuid.uuid4().hex[:8]
-    with _db() as c:
-        c.execute("INSERT INTO conversations (id, created_at) VALUES (?, ?)", (cid, _now()))
-    return cid
+def kb_version():
+    """Short fingerprint of the KB file, so a draft row says which KB produced it."""
+    try:
+        return hashlib.sha1(KB_PATH.read_bytes()).hexdigest()[:10]
+    except OSError:
+        return None
 
 
-def conversation_exists(cid):
-    with _db() as c:
-        return c.execute("SELECT 1 FROM conversations WHERE id=?", (cid,)).fetchone() is not None
-
-
-def add_message(cid, sender, text):
-    with _db() as c:
-        cur = c.execute("INSERT INTO messages (conv_id, sender, text, created_at) VALUES (?,?,?,?)",
-                        (cid, sender, text, _now()))
-        return cur.lastrowid
-
-
-def list_messages(cid):
-    with _db() as c:
-        rows = c.execute("SELECT id, sender, text, created_at FROM messages WHERE conv_id=? ORDER BY id",
-                         (cid,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def unanswered_customer_texts(cid):
-    """Customer messages sent after the agent's last reply, oldest first."""
-    with _db() as c:
-        last_agent = c.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE conv_id=? AND sender='agent'",
-                               (cid,)).fetchone()[0]
-        rows = c.execute("SELECT text FROM messages WHERE conv_id=? AND sender='customer' AND id>? ORDER BY id",
-                         (cid, last_agent)).fetchall()
-    return [r["text"] for r in rows]
-
-
-def generation_context(cid, hours=24, max_messages=4, max_chars=1000):
-    """Return the bounded conversation context for one explicit Generate action.
-
-    Customer messages after the last agent reply are always prioritised. Up to
-    four immediately preceding messages supply context for short follow-ups.
-    This deterministic window avoids a separate summarisation LLM call.
-    """
-    with _db() as c:
-        # Timestamps are stored as UTC ISO-8601 strings.  Compare like with
-        # like rather than SQLite's different datetime text representation.
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=int(hours))).isoformat(timespec="seconds")
-        rows = c.execute(
-            "SELECT id, sender, text, created_at FROM messages "
-            "WHERE conv_id=? AND created_at >= ? ORDER BY id ASC",
-            (cid, cutoff),
-        ).fetchall()
-    items = [dict(r) for r in rows]
+def bound_context(items, max_messages=4, max_chars=1000):
+    """Pure rule (no DB): items = [{sender, text, ...}] oldest first. Keep the last agent exchange plus
+    all newer customer messages, trimmed to max_messages / max_chars."""
+    items = list(items)
     if not items:
         return []
     last_agent = max((n for n, m in enumerate(items) if m["sender"] == "agent"), default=-1)
@@ -146,95 +113,74 @@ def generation_context(cid, hours=24, max_messages=4, max_chars=1000):
     return window
 
 
-def save_draft(cid, result, context):
+def save_draft(chat_id, result, latest_message_id, agent_user_id, customer_user_id=None, llm_model=None):
+    """Insert the draft row (outcome 'pending'). Raises DraftExists if this chat message already has a draft."""
+    tokens = result.get("tokens") or {}
+    vals = (result.get("status", "ERROR"), result.get("draft", ""),
+            json.dumps(result.get("used") or []), json.dumps(result.get("sources") or []),
+            json.dumps(result.get("query") or {}, ensure_ascii=False), result.get("error"),
+            tokens.get("in"), tokens.get("out"), result.get("ms"), llm_model, kb_version())
     with _db() as c:
-        version = c.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM drafts WHERE conv_id=?", (cid,)).fetchone()[0]
-        cur = c.execute(
-            "INSERT INTO drafts (conv_id, version, status, draft, used, sources, query, tokens, ms, error, "
-            "context_ids, context_last_message_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (cid, version, result.get("status", "ERROR"), result.get("draft", ""),
-             json.dumps(result.get("used") or []), json.dumps(result.get("sources") or []),
-             json.dumps(result.get("query") or {}), json.dumps(result.get("tokens") or {}),
-             result.get("ms"), result.get("error"), json.dumps([m["id"] for m in context]),
-             context[-1]["id"] if context else None, _now()))
-        return cur.lastrowid
+        try:
+            cur = c.execute(
+                "INSERT INTO chat_support_drafts (chat_id, agent_user_id, customer_user_id, latest_message_id, "
+                "status, draft_text, used_chunks, sources, query_json, error, tokens_in, tokens_out, ms, "
+                "llm_model, kb_version, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (chat_id, agent_user_id, customer_user_id, latest_message_id) + vals + (_now(),))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            raise DraftExists()  # one draft per customer message; the agent edits it instead of regenerating
 
 
-def latest_draft(cid):
-    """Newest draft that has not been answered yet, or None."""
+def message_has_draft(chat_id, latest_message_id):
     with _db() as c:
-        r = c.execute("SELECT * FROM drafts WHERE conv_id=? AND answered=0 ORDER BY id DESC LIMIT 1",
-                      (cid,)).fetchone()
-    if not r:
-        return None
-    return {"id": r["id"], "status": r["status"], "draft": r["draft"], "ms": r["ms"], "error": r["error"],
-            "used": json.loads(r["used"] or "[]"), "sources": json.loads(r["sources"] or "[]"),
-            "query": json.loads(r["query"] or "{}"), "tokens": json.loads(r["tokens"] or "{}"),
-            "context_ids": json.loads(r["context_ids"] or "[]"),
-            "context_last_message_id": r["context_last_message_id"]}
+        return c.execute("SELECT 1 FROM chat_support_drafts WHERE chat_id=? AND latest_message_id=?",
+                         (chat_id, latest_message_id)).fetchone() is not None
 
 
-def mark_answered(cid, draft_id=None):
+def draft_exists(draft_id):
     with _db() as c:
-        if draft_id:
-            c.execute("UPDATE drafts SET answered=1 WHERE id=? AND conv_id=?", (draft_id, cid))
+        return c.execute("SELECT 1 FROM chat_support_drafts WHERE id=?", (draft_id,)).fetchone() is not None
+
+
+def save_feedback(draft_id, customer_text, final_text, sent_message_id=None):
+    """Compares the sent reply with the draft the agent saw and stores it on the same row. Returns the outcome."""
+    with _db() as c:
+        r = c.execute("SELECT status, draft_text, outcome, chat_id FROM chat_support_drafts WHERE id=?",
+                      (draft_id,)).fetchone()
+        if not r:
+            raise KeyError(draft_id)
+        if r["outcome"] != "pending":  # idempotent: a retry returns the first result and writes nothing
+            log_info("feedback", f"draft={draft_id} repeat ignored")
+            return r["outcome"]
+        draft_text = (r["draft_text"] or "") if r["status"] != "ERROR" else ""
+        if not draft_text.strip():
+            outcome = "no_draft"
+        elif final_text.strip() == draft_text.strip():
+            outcome = "accepted"
+        elif difflib.SequenceMatcher(None, draft_text.strip(), final_text.strip()).ratio() >= EDITED_MIN_SIMILARITY:
+            outcome = "edited"
         else:
-            c.execute("UPDATE drafts SET answered=1 WHERE conv_id=?", (cid,))
-
-
-def draft_has_new_customer_message(cid, draft_id):
-    """True when a customer wrote after the context used for this draft."""
-    if not draft_id:
-        return False
-    with _db() as c:
-        row = c.execute(
-            "SELECT context_last_message_id FROM drafts WHERE id=? AND conv_id=?", (draft_id, cid)
-        ).fetchone()
-        if not row or row["context_last_message_id"] is None:
-            return False
-        newer = c.execute(
-            "SELECT 1 FROM messages WHERE conv_id=? AND sender='customer' AND id>? LIMIT 1",
-            (cid, row["context_last_message_id"]),
-        ).fetchone()
-    return newer is not None
-
-
-def save_feedback(cid, draft_id, customer_text, final_text):
-    """Compares the sent reply with the draft the agent saw. Returns the outcome label."""
-    draft_text = ""
-    if draft_id:
-        with _db() as c:
-            r = c.execute("SELECT draft, status FROM drafts WHERE id=? AND conv_id=?", (draft_id, cid)).fetchone()
-        if r and r["status"] != "ERROR":
-            draft_text = r["draft"] or ""
-    if not draft_text.strip():
-        outcome = "no_draft"
-    elif final_text.strip() == draft_text.strip():
-        outcome = "accepted"
-    elif difflib.SequenceMatcher(None, draft_text.strip(), final_text.strip()).ratio() >= EDITED_MIN_SIMILARITY:
-        outcome = "edited"
-    else:
-        outcome = "rewritten"
-    with _db() as c:
-        c.execute("INSERT INTO feedback (conv_id, draft_id, customer_text, draft_text, final_text, outcome, created_at)"
-                  " VALUES (?,?,?,?,?,?,?)",
-                  (cid, draft_id, customer_text, draft_text, final_text, outcome, _now()))
-    log_info("feedback", f"conv={cid} outcome={outcome}")
+            outcome = "rewritten"
+        c.execute("UPDATE chat_support_drafts SET final_text=?, customer_text=?, outcome=?, sent_message_id=?, "
+                  "sent_at=? WHERE id=?", (final_text, customer_text, outcome, sent_message_id, _now(), draft_id))
+    log_info("feedback", f"draft={draft_id} outcome={outcome}")
     return outcome
 
 
 def pending_feedback(limit=200):
-    """Feedback rows not yet prepared as private weekly-review candidates."""
+    """Sent drafts not yet prepared as private weekly-review candidates."""
     with _db() as c:
         rows = c.execute(
-            "SELECT f.id, f.conv_id, f.customer_text, f.draft_text, f.final_text, f.outcome, f.created_at, "
-            "d.status AS draft_status, d.query AS draft_query FROM feedback f "
-            "LEFT JOIN drafts d ON d.id = f.draft_id WHERE f.indexed=0 ORDER BY f.id LIMIT ?", (limit,)).fetchall()
+            "SELECT id, chat_id, customer_text, draft_text, final_text, outcome, sent_at, status, query_json "
+            "FROM chat_support_drafts WHERE sent_at IS NOT NULL AND review_state=0 ORDER BY id LIMIT ?",
+            (limit,)).fetchall()
     out = []
     for r in rows:
-        x = dict(r)
-        x["draft_query"] = json.loads(x["draft_query"] or "{}")
-        out.append(x)
+        out.append({"id": r["id"], "conv_id": f"chat-{r['chat_id']}", "customer_text": r["customer_text"],
+                    "draft_text": r["draft_text"], "final_text": r["final_text"], "outcome": r["outcome"],
+                    "created_at": r["sent_at"], "draft_status": r["status"],
+                    "draft_query": json.loads(r["query_json"] or "{}")})
     return out
 
 
@@ -243,12 +189,12 @@ def mark_feedback_indexed(ids, value):
     if not ids:
         return
     with _db() as c:
-        c.executemany("UPDATE feedback SET indexed=? WHERE id=?", [(value, i) for i in ids])
+        c.executemany("UPDATE chat_support_drafts SET review_state=? WHERE id=?", [(value, i) for i in ids])
 
 
 def reset_feedback_index():
     with _db() as c:
-        c.execute("UPDATE feedback SET indexed=0")
+        c.execute("UPDATE chat_support_drafts SET review_state=0")
 
 
 def _nums(ids):
@@ -256,20 +202,21 @@ def _nums(ids):
 
 
 def active_feedback_ids(ids):
-    """ids look like 'f12'. Returns the subset whose feedback row is still status 'active'."""
+    """ids look like 'f12' (f + draft id). Returns the subset whose review_status is still 'active'."""
     nums = _nums(ids)
     if not nums:
         return set()
     with _db() as c:
-        rows = c.execute(f"SELECT id FROM feedback WHERE status='active' AND id IN ({','.join('?' * len(nums))})",
-                         nums).fetchall()
+        rows = c.execute("SELECT id FROM chat_support_drafts WHERE review_status='active' AND id IN "
+                         f"({','.join('?' * len(nums))})", nums).fetchall()
     return {f"f{r['id']}" for r in rows}
 
 
 def review_candidate_ids():
     """Private review candidates that are still waiting for a reviewer decision."""
     with _db() as c:
-        rows = c.execute("SELECT id FROM feedback WHERE indexed=1 AND status='active' ORDER BY id").fetchall()
+        rows = c.execute("SELECT id FROM chat_support_drafts WHERE review_state=1 AND review_status='active' "
+                         "ORDER BY id").fetchall()
     return [f"f{r['id']}" for r in rows]
 
 
@@ -281,14 +228,13 @@ def feedback_details(ids):
         return {}
     with _db() as c:
         rows = c.execute(
-            "SELECT f.id, f.customer_text, f.final_text, f.outcome, d.status AS draft_status, d.used AS draft_used, "
-            "d.query AS draft_query FROM feedback f LEFT JOIN drafts d ON d.id = f.draft_id "
-            f"WHERE f.id IN ({','.join('?' * len(nums))})", nums).fetchall()
+            "SELECT id, customer_text, final_text, outcome, status AS draft_status, used_chunks, query_json "
+            f"FROM chat_support_drafts WHERE id IN ({','.join('?' * len(nums))})", nums).fetchall()
     out = {}
     for r in rows:
         x = dict(r)
-        x["draft_used"] = json.loads(x["draft_used"] or "[]")
-        x["draft_feature"] = json.loads(x.pop("draft_query") or "{}").get("feature", "")
+        x["draft_used"] = json.loads(x.pop("used_chunks") or "[]")
+        x["draft_feature"] = json.loads(x.pop("query_json") or "{}").get("feature", "")
         out[f"f{x['id']}"] = x
     return out
 
@@ -296,51 +242,55 @@ def feedback_details(ids):
 def set_feedback_status(ids, status):
     """status: active | merged (now in the KB) | rejected (reviewer said no)."""
     with _db() as c:
-        c.executemany("UPDATE feedback SET status=? WHERE id=?", [(status, n) for n in _nums(ids)])
+        c.executemany("UPDATE chat_support_drafts SET review_status=? WHERE id=?", [(status, n) for n in _nums(ids)])
 
 
 def clear_pending_proposals():
     with _db() as c:
-        c.execute("DELETE FROM proposals WHERE status='pending'")
+        c.execute("DELETE FROM support_review_proposals WHERE status='pending'")
 
 
 def add_proposal(p):
     with _db() as c:
         cur = c.execute(
-            "INSERT INTO proposals (action, chunk_id, part, title, audience, body, old_text, reason, keywords,"
-            " feedback_ids, examples, candidates, extra, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO support_review_proposals (action, chunk_id, part, title, audience, body, old_text, "
+            "keywords, draft_ids, examples, extra, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (p["action"], p["chunk_id"], p["part"], p["title"], p["audience"], p["body"], p["old_text"],
-             p["reason"], json.dumps(p["keywords"]), json.dumps(p["feedback_ids"]),
-             json.dumps(p["examples"], ensure_ascii=False), json.dumps(p.get("candidates") or [], ensure_ascii=False),
-             json.dumps(p.get("extra") or {}, ensure_ascii=False), _now()))
+             json.dumps(p["keywords"]), json.dumps(p["feedback_ids"]),
+             json.dumps(p["examples"], ensure_ascii=False), json.dumps(p.get("extra") or {}, ensure_ascii=False),
+             _now()))
         return cur.lastrowid
 
 
 def _proposal(r):
     d = dict(r)
-    for k in ("keywords", "feedback_ids", "examples", "candidates"):
+    for k in ("keywords", "draft_ids", "examples"):
         d[k] = json.loads(d[k] or "[]")
+    d["feedback_ids"] = d["draft_ids"]  # old name, kept so the review page keeps working
     d["extra"] = json.loads(d.get("extra") or "{}")
     return d
 
 
 def list_proposals(status="pending"):
     with _db() as c:
-        rows = c.execute("SELECT * FROM proposals WHERE status=? ORDER BY id", (status,)).fetchall()
+        rows = c.execute("SELECT * FROM support_review_proposals WHERE status=? ORDER BY id", (status,)).fetchall()
     return [_proposal(r) for r in rows]
 
 
 def get_proposal(pid):
     with _db() as c:
-        r = c.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+        r = c.execute("SELECT * FROM support_review_proposals WHERE id=?", (pid,)).fetchone()
     return _proposal(r) if r else None
 
 
-def set_proposal_status(pid, status, title=None, audience=None, body=None, action=None, chunk_id=None):
-    """Keeps the final approved text and what was done (replace/add and which chunk): a history of KB changes."""
+def set_proposal_status(pid, status, title=None, audience=None, body=None, action=None, chunk_id=None,
+                        decided_by=None):
+    """Keeps the final approved text, what was done (replace/add and which chunk), and who decided and when."""
     with _db() as c:
         if body is None:
-            c.execute("UPDATE proposals SET status=? WHERE id=?", (status, pid))
+            c.execute("UPDATE support_review_proposals SET status=?, decided_by=?, decided_at=? WHERE id=?",
+                      (status, decided_by, _now(), pid))
         else:
-            c.execute("UPDATE proposals SET status=?, title=?, audience=?, body=?, action=?, chunk_id=? WHERE id=?",
-                      (status, title, audience, body, action, chunk_id, pid))
+            c.execute("UPDATE support_review_proposals SET status=?, title=?, audience=?, body=?, action=?, "
+                      "chunk_id=?, decided_by=?, decided_at=? WHERE id=?",
+                      (status, title, audience, body, action, chunk_id, decided_by, _now(), pid))
