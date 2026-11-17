@@ -19,13 +19,16 @@ Reply JSON only: {"status": "ANSWERED|CLARIFY|NOT_IN_KB", "draft": "...", "used"
 
 
 def build_query_messages(thread_text):
-    return [{"role": "system", "content": QUERY_SYSTEM_PROMPT},
+    from app import features
+    names = ", ".join(f["name"] for f in features.load())
+    rule = f"\n5. feature: the RoxStar feature(s) the issue is about, from: {names}. Several: comma separated. Empty if unsure."
+    return [{"role": "system", "content": QUERY_SYSTEM_PROMPT + rule},
             {"role": "user", "content": f"Customer messages (oldest first):\n{thread_text}\n\nFor language_and_script look ONLY at the last Customer line; ignore Agent lines and older messages."}]
 
 
 def build_draft_messages(thread_text, kb_chunks, past_replies=None, language_note=""):
     """kb_chunks: list of {"id","text"}; past_replies: list of {"id","question","reply"} (optional)."""
-    kb = "\n\n".join(f"[{c['id']}] {c['text']}" for c in kb_chunks) or "(no matching KB chunks)"
+    kb = "\n\n".join(f"[{c['id']}]{' (' + c['feature'] + ')' if c.get('feature') else ''} {c['text']}" for c in kb_chunks) or "(no matching KB chunks)"
     past = ""
     if past_replies:
         past = "\n\nPAST REPLIES (approved by agents; win over KB if they conflict):\n" + "\n".join(
@@ -36,7 +39,7 @@ def build_draft_messages(thread_text, kb_chunks, past_replies=None, language_not
             {"role": "user", "content": user}]
 
 
-CLARIFY_SYSTEM_PROMPT = """You write a short DRAFT reply for a RoxStar support agent. The customer has not stated an issue yet (greeting or general help). Write ONE short, friendly question asking how you can help (e.g. asking about Tug of War, PK, Live Shows, or recordings). State no facts, promise nothing, at most one emoji. Follow the reply language instruction. JSON only: {"draft": "..."}"""
+CLARIFY_SYSTEM_PROMPT = """You write a short DRAFT reply for a RoxStar support agent. The customer has not stated an issue yet (greeting or general help). Write ONE short, friendly question asking how you can help. Do NOT name or suggest any feature, topic or option. State no facts, promise nothing, at most one emoji. Follow the reply language instruction. JSON only: {"draft": "..."}"""
 
 
 def build_clarify_messages(thread_text, language_note):

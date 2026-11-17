@@ -132,7 +132,11 @@ def n_retrieve(state):
     eq = info["english_query"]
     qv = embed([eq])[0]
     k = 3 if info["ambiguous"] else 2
-    chunks = get_retriever().search(eq, role=None, top_k=k, conv_id=state["conv_id"], query_vector=qv)
+    from app import features
+    from app.retriever import match_features
+    fids = match_features(info.get("feature"), features.load())
+    chunks = get_retriever().search(eq, role=None, top_k=k if len(fids) < 2 else max(k, len(fids)),
+                                    conv_id=state["conv_id"], query_vector=qv, feature_ids=fids)
     past = get_past_replies(eq, conv_id=state["conv_id"], query_vector=qv)
     top = max((c["dense_sim"] for c in chunks if c["dense_sim"] is not None), default=0.0)
     return {"chunks": chunks, "top_dense": top, "past": past}
@@ -152,7 +156,7 @@ def n_low_sim(state):
 def n_draft(state):
     chunks = state["chunks"]
     past = state.get("past") or []
-    msgs = build_draft_messages(state["thread"], [{"id": c["id"], "text": c["text"]} for c in chunks],
+    msgs = build_draft_messages(state["thread"], [{"id": c["id"], "text": c["text"], "feature": c.get("feature_name")} for c in chunks],
                                 past, LANG_NOTE[_lang_key(state["query_info"])])
     data, usage, _ = chat_json(msgs, DRAFT_MODEL, 300, "draft", state["conv_id"])
     status = data.get("status")

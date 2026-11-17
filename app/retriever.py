@@ -10,6 +10,24 @@ from app.kb_common import CHROMA_PATH, KB_COLLECTION, embed, log_error, log_info
 _SPLIT = re.compile(r"[\s\.,;:!?()\[\]{}\"'`*|#/\\<>=+~^%&@$\-–—।]+")
 
 
+FEATURE_BOOST = 0.002  # soft nudge on the RRF scale (one rank step near the top is about 0.0003 to 0.0005)
+
+
+def match_features(hint, features):
+    """Feature ids named in the query builder's free-text guess ('PK Battle, Tug of War'). Unknown text matches nothing."""
+    out = []
+    for part in re.split(r"[,/&+]|\band\b", (hint or "").lower()):
+        part = part.strip()
+        if len(part) < 2:
+            continue
+        for f in features:
+            name = f["name"].lower()
+            if part == f["id"] or part in name or name in part:
+                if f["id"] not in out:
+                    out.append(f["id"])
+    return out
+
+
 def tokenize(text):
     return [w for w in _SPLIT.split(text.lower()) if w]
 
@@ -39,7 +57,7 @@ class Retriever:
             return meta.get("for_participant", True)
         return True
 
-    def search(self, query, role=None, top_k=3, n_candidates=10, conv_id=None, query_vector=None):
+    def search(self, query, role=None, top_k=3, n_candidates=10, conv_id=None, query_vector=None, feature_ids=None):
         """role: 'broadcaster', 'participant' or None (no filter). Returns a list of dicts.
         Optional query_vector avoids duplicate embedding calculations when already computed."""
         tag = f"conv={conv_id} " if conv_id else ""
@@ -70,12 +88,28 @@ class Retriever:
             rrf[i] = rrf.get(i, 0.0) + 1.0 / (60 + rank + 1)
         for rank, i in enumerate(bm_ids):
             rrf[i] = rrf.get(i, 0.0) + 1.0 / (60 + rank + 1)
-        order = sorted(rrf, key=rrf.get, reverse=True)[:top_k]
+        # soft signals: a small boost for the guessed feature(s), and at least one chunk per named feature
+        hinted = set(feature_ids or [])
+        fid_of = lambda i: self.metas[self.pos[i]].get("feature_id")
+        for i in rrf:
+            if fid_of(i) in hinted:
+                rrf[i] += FEATURE_BOOST
+        ranked_ids = sorted(rrf, key=rrf.get, reverse=True)
+        order = ranked_ids[:top_k]
+        if len(hinted) > 1:
+            for fid in hinted:
+                if all(fid_of(i) != fid for i in order):
+                    best = next((i for i in ranked_ids if fid_of(i) == fid), None)
+                    if best:  # replace the lowest chunk whose feature is still represented by another chunk
+                        for drop in reversed(order):
+                            if sum(1 for j in order if fid_of(j) == fid_of(drop)) > 1:
+                                order[order.index(drop)] = best
+                                break
 
         out = []
         for i in order:
             m = self.metas[self.pos[i]]
-            out.append({"id": i, "feature_id": m.get("feature_id"), "topic": m.get("topic"), "title": m["title"], "audience": m.get("audience", "Everyone"),
+            out.append({"id": i, "feature_id": m.get("feature_id"), "topic": m.get("topic"), "feature_name": m.get("feature_name"), "title": m["title"], "audience": m.get("audience", "Everyone"),
                         "text": self.docs[self.pos[i]], "dense_sim": dense_sim.get(i),
                         "bm25": bm_score.get(i), "rrf": rrf[i]})
         log_info("search", f"{tag}query='{query[:60]}' role={role} -> {[r['id'] for r in out]}")

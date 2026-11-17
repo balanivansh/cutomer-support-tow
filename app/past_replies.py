@@ -1,7 +1,8 @@
 """Private weekly-review candidates. Edited or rewritten agent replies saved in
-SQLite are embedded so the review page can group similar corrections.  This
-collection is deliberately not queried by the draft pipeline: only a reviewer
-can promote facts into the authoritative KB.
+SQLite are embedded so the review page can group similar corrections. The draft
+pipeline DOES query this collection (similarity >= PAST_SIM_THRESHOLD) so a
+correction helps the same week; but only a reviewer can promote facts into the
+authoritative KB (Weekly Review Apply).
 Rebuild everything from SQLite:  python -m app.past_replies"""
 import os
 import chromadb
