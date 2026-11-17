@@ -5,7 +5,7 @@ QUERY_SYSTEM_PROMPT = """RoxStar support parser. JSON only:
 1. english_query: Translate issue to clear English. Empty ONLY if greeting/vague.
 2. Keep all named features/terms (Tug of War, PK, Live, audition, recording, credits, coins). Never drop any.
 3. Keep exact issue ('not showing' means not visible, don't change to 'not starting').
-4. vague: greeting/help with no issue. off_topic: not RoxStar."""
+4. Judge intent from ALL customer lines, not only the last one. If ANY line states an issue or question, intent=real_question and english_query covers it; filler lines (hi, help, please, urgent, ok) never cancel an issue. vague: ONLY if no line states any issue. off_topic: not RoxStar."""
 
 DRAFT_SYSTEM_PROMPT = """You write a DRAFT reply for a RoxStar support agent.
 LANGUAGE (highest priority): write the draft in the language on the "REPLY LANGUAGE" line at the end. Follow it exactly, even if the KB chunks, agent messages or examples are in another language (translate the KB facts). Never mix languages.

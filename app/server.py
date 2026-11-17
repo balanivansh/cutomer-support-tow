@@ -87,6 +87,9 @@ async def api_draft(body: DraftRequest):
     _generating.add(cid)
     try:
         lines = [f"{m['sender'].title()}: {m['text']}" for m in context]
+        log_info("api_context", f"chat={body.chat_id} received={len(items)} kept={len(context)} "
+                                f"chars={sum(len(m['text']) for m in context)} "
+                                f"first_kept={context[0]['text'][:40]!r}")
         async with _gate:
             result = await asyncio.to_thread(generate_draft, lines, cid)
         draft_id = store.save_draft(body.chat_id, result, body.latest_message_id, body.agent_user_id,
