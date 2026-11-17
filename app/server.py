@@ -166,6 +166,20 @@ async def features_add_audience(fid: str, b: NewAudience):
         raise HTTPException(400, str(e))
 
 
+class NewTopic(BaseModel):
+    name: str
+
+
+@app.post("/api/features/{fid}/topics")
+async def features_add_topic(fid: str, b: NewTopic):
+    """Human action: adds a '## PART X: NAME' heading to this feature's own KB file only."""
+    try:
+        features.add_topic(fid, b.name)
+        return _feature_json(features.get(fid))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/review/proposals")
 async def review_list():
     return [p for p in store.list_proposals("pending") if p.get("extra")]  # cards from the old page have no extra

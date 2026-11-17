@@ -64,21 +64,36 @@ This will:
 ```
 tow-support-assistant/
 ├── app/
-│   ├── __init__.py
-│   ├── config.py          # Settings loader (pydantic-settings + .env)
-│   └── logging_config.py  # Structured logging with rich colours
+│   ├── server.py          # FastAPI: /api/draft, /api/feedback, /api/features, /review, /api/review/*
+│   ├── pipeline.py        # LangGraph draft pipeline (query -> clarify | retrieve -> hold | draft)
+│   ├── retriever.py       # Hybrid search: Chroma vectors + BM25, rank fusion
+│   ├── kb_ingest.py       # Rebuilds the Chroma KB index from every feature file (ids like tow:B5)
+│   ├── features.py        # Feature registry (data/features.json), topics, add feature / add topic
+│   ├── review.py          # Weekly Review: cluster agent edits, propose, apply to ONE feature's file
+│   ├── past_replies.py    # Embedded agent edits (review workspace + short-term past replies)
+│   ├── store.py           # SQLite state: chat_support_drafts, support_review_proposals
+│   ├── llm.py, prompts.py, kb_common.py, keywords.py, config.py, mysql.py, logging_config.py
+│   └── static/review.html # Weekly Review page
 ├── data/
-│   └── .gitkeep           # Put your KB file here (not committed)
-├── logs/
-│   └── .gitkeep           # Rotating log files (not committed)
-├── scripts/
-│   └── check_models.py    # Live model availability & quality check
-├── .env                   # Your secrets (NOT committed)
-├── .env.example           # Template — safe to commit
-├── .gitignore
-├── requirements.txt
-└── README.md
+│   ├── kb/                # tow.md, pk.md, popular-singer.md, friendship.md (one file per feature)
+│   ├── kb_backups/        # copy of a KB file before each Apply
+│   ├── features.json, keywords.json
+│   └── app.db, chroma/    # engine state and vectors (not committed)
+├── docs/web-api-contract.md  # API contract for the Lovable portal
+├── scripts/               # evaluate_batch.py (evaluation set), check_models.py
+├── dummy/                 # old flow kept for reference
+├── .env, .env.example, requirements.txt
 ```
+
+## Everyday commands
+
+```bash
+.venv/bin/python3 -m app.kb_ingest                      # after editing any data/kb/*.md
+.venv/bin/uvicorn app.server:app --port 8000            # run the engine
+.venv/bin/python3 scripts/evaluate_batch.py             # evaluation set (writes data/eval_results.json)
+```
+
+Full design: `../rox-chat/docs/architecture.md` (Part 1).
 
 ---
 

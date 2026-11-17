@@ -75,7 +75,7 @@ class Retriever:
         out = []
         for i in order:
             m = self.metas[self.pos[i]]
-            out.append({"id": i, "title": m["title"], "audience": m.get("audience", "Everyone"),
+            out.append({"id": i, "feature_id": m.get("feature_id"), "topic": m.get("topic"), "title": m["title"], "audience": m.get("audience", "Everyone"),
                         "text": self.docs[self.pos[i]], "dense_sim": dense_sim.get(i),
                         "bm25": bm_score.get(i), "rrf": rrf[i]})
         log_info("search", f"{tag}query='{query[:60]}' role={role} -> {[r['id'] for r in out]}")

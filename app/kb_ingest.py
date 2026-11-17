@@ -1,9 +1,11 @@
-"""Parse the support KB into chunks (one '###' heading = one chunk) and store them in Chroma.
+"""Parse every feature's KB file (data/kb/<file>.md; one '###' heading = one chunk) and store the chunks in Chroma.
+Chunk ids are namespaced with the feature id: 'tow:B1', 'pk:B1'. A feature file with no questions yet adds nothing.
 Run:  python -m app.kb_ingest      (safe to re-run: it rebuilds the collection)"""
 import re
 import sys
 
-from app.kb_common import (CHROMA_PATH, EMBEDDING_MODEL, KB_COLLECTION, KB_PATH,
+from app import features
+from app.kb_common import (CHROMA_PATH, EMBEDDING_MODEL, KB_COLLECTION,
                            embed, log_error, log_info)
 
 PART_RE = re.compile(r"^##\s+(PART\s+[A-Z]):\s*(.*)$")
@@ -82,12 +84,27 @@ def parse_kb(text):
     return chunks
 
 
+def load_all_chunks():
+    """Chunks of every feature, ids namespaced. Returns (chunks, per_feature_counts)."""
+    chunks, counts = [], {}
+    for f in features.load():
+        path = features.kb_path(f)
+        if not path.exists():
+            log_error("CONFIG_ERROR", "read_kb", f"KB file of feature {f['id']} not found at {path}. Skipping it.")
+            continue
+        parsed = parse_kb(path.read_text(encoding="utf-8"))
+        for c in parsed:
+            local = c["id"]
+            c["id"] = f"{f['id']}:{local}"
+            c["meta"].update({"chunk_id": c["id"], "local_id": local, "feature_id": f["id"],
+                              "feature_name": f["name"], "topic": c["meta"]["part"]})
+        counts[f["id"]] = len(parsed)
+        chunks += parsed
+    return chunks, counts
+
+
 def main():
-    if not KB_PATH.exists():
-        log_error("CONFIG_ERROR", "read_kb",
-                  f"KB file not found at {KB_PATH}. Copy cust_supp_kb.md into data/ or fix KB_PATH in .env.")
-        sys.exit(1)
-    chunks = parse_kb(KB_PATH.read_text(encoding="utf-8"))
+    chunks, counts = load_all_chunks()
     ids = [c["id"] for c in chunks]
     dupes = {i for i in ids if ids.count(i) > 1}
     if dupes:
@@ -96,7 +113,7 @@ def main():
     if not chunks:
         log_error("CONFIG_ERROR", "parse_kb", "No chunks found. Check the KB uses '### B5. Title' style headings.")
         sys.exit(1)
-    log_info("parse_kb", f"Parsed {len(chunks)} chunks from {KB_PATH.name}")
+    log_info("parse_kb", f"Parsed {len(chunks)} chunks: {counts}")
 
     try:
         vectors = embed([c["text"] for c in chunks])
@@ -121,7 +138,7 @@ def main():
     log_info("store_chunks", f"Stored {stored} chunks in Chroma ({EMBEDDING_MODEL}, dim {len(vectors[0])})")
     for c in chunks:
         m = c["meta"]
-        print(f"  {c['id']:<4} {m['audience']:<24} {len(c['text']):>5} chars  {m['title'][:60]}")
+        print(f"  {c['id']:<18} {m['audience']:<24} {len(c['text']):>5} chars  {m['title'][:60]}")
     if stored != len(chunks):
         log_error("RETRIEVAL_ERROR", "store_chunks", f"Expected {len(chunks)} chunks but Chroma holds {stored}.")
         sys.exit(1)

@@ -86,11 +86,18 @@ function card(p) {
 
   const addTopicBtn = el('button', 'small-btn', '+ Add topic/part');
   addTopicBtn.type = 'button';
-  addTopicBtn.onclick = () => {
-    const tname = (prompt('Enter new topic or section title (e.g. Live approval, Stream setup):') || '').trim();
+  addTopicBtn.onclick = async () => {
+    const f = feat();
+    if (!f) { alert('Pick a feature first'); return; }
+    const tname = (prompt('Enter new topic title for ' + f.name + ' (e.g. Refunds, Stream setup):') || '').trim();
     if (!tname) return;
-    const opt = el('option', '', tname); opt.value = tname;
-    tsel.append(opt); tsel.value = tname;
+    try {
+      const nf = await post('/api/features/' + f.id + '/topics', {name: tname});  // writes "## PART X" into this feature's file
+      f.topics = nf.topics;
+      drawTopics();
+      const hit = f.topics.find(t => t.name.toLowerCase() === tname.toLowerCase());
+      if (hit) tsel.value = hit.part;
+    } catch (e) { alert('Could not add topic: ' + e.message); }
   };
   const tHeader = el('div', 'mute', 'Topic / Section '); tHeader.append(addTopicBtn);
   tw.append(tHeader, tsel);

@@ -3,16 +3,34 @@
   {
    "id": "tow",
    "name": "Tug of War",
-   "kb_file": "cust_supp_kb.md",
+   "kb_file": "tow.md",
    "audiences": [
     "Broadcaster",
     "Participant"
    ]
   },
   {
-   "id": "party_room",
-   "name": "Party Room",
-   "kb_file": "cust_supp_kb.md",
+   "id": "pk",
+   "name": "PK Battle",
+   "kb_file": "pk.md",
+   "audiences": [
+    "Broadcaster",
+    "Participant"
+   ]
+  },
+  {
+   "id": "popular_singer",
+   "name": "Popular Singer Contest",
+   "kb_file": "popular-singer.md",
+   "audiences": [
+    "Broadcaster",
+    "Participant"
+   ]
+  },
+  {
+   "id": "friendship",
+   "name": "Friendship Feature",
+   "kb_file": "friendship.md",
    "audiences": [
     "Broadcaster",
     "Participant"

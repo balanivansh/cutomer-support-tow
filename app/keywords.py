@@ -1,9 +1,9 @@
 """Keyword list for the query builder, kept in data/keywords.json. The weekly review can add words."""
 import json
 
-from app.kb_common import KB_PATH, log_error
+from app.kb_common import DATA_DIR, log_error
 
-KW_PATH = KB_PATH.parent / "keywords.json"
+KW_PATH = DATA_DIR / "keywords.json"
 DEFAULTS = ["Tug of War", "free credit", "Gold Coins", "Health Heart", "weekly review", "recording",
             "Reveal Time", "leaderboard", "daily live target", "Piggy icon", "broadcaster", "participant"]
 

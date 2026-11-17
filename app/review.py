@@ -15,7 +15,7 @@ from datetime import datetime
 import numpy as np
 
 from app import features, keywords, past_replies, store
-from app.kb_common import KB_PATH, ROOT, log_error, log_info
+from app.kb_common import ROOT, log_error, log_info
 from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, chat_json
 from app.pipeline import get_retriever
 
@@ -23,7 +23,7 @@ CLUSTER_SIM = 0.80  # English queries at least this similar = same topic
 MAX_TOPICS = 15
 MAX_EXAMPLES = 3
 HEAD = re.compile(r"^### ([A-Z]\d+)\. (.*)$")
-KB_ID = re.compile(r"^[A-Z]\d+$")
+KB_ID = re.compile(r"^(?:([a-z0-9_]+):)?([A-Z]\d+)$")  # "tow:B5" (old rows: "B5")
 _lock = threading.Lock()
 
 # Edit these two prompts freely. They are generic on purpose.
@@ -152,16 +152,17 @@ def _pick_feature(details):
     return features.load()[0]
 
 
-def _stored_point(lines, details):
+def _stored_point(lines, details, feature_id):
     """The KB point the drafts answered from (most used). None if the drafts were holding replies
-    (NOT_IN_KB) or only used past replies."""
+    (NOT_IN_KB) or only used past replies. Only points of this feature count."""
     count = Counter()
     for d in details:
         if d.get("draft_status") != "ANSWERED":
             continue
         for u in d.get("draft_used") or []:
-            if KB_ID.match(str(u)):
-                count[str(u)] += 1
+            m = KB_ID.match(str(u))
+            if m and m.group(1) in (None, feature_id):
+                count[m.group(2)] += 1
                 break
     for cid, _ in count.most_common():
         try:
@@ -175,7 +176,7 @@ def _propose(cluster):
     details = store.feedback_details([e["id"] for e in cluster]).values()
     feature = _pick_feature(details)
     lines = features.kb_path(feature).read_text(encoding="utf-8").splitlines()
-    stored = _stored_point(lines, details)
+    stored = _stored_point(lines, details, feature["id"])
     topics = features.topics(feature)
     pairs = "\n".join(f"Customer: {e['eq'] or e['q']}\nAgent reply: {e['reply']}" for e in cluster[-MAX_EXAMPLES:])
     user = ("TOPIC LIST: " + ", ".join(t["name"] for t in topics) + "\nKEYWORD LIST: " + ", ".join(keywords.load())
@@ -186,7 +187,7 @@ def _propose(cluster):
     solution = str(data.get("solution") or cluster[-1]["reply"]).strip()
     topic = str(data.get("topic") or "").strip().lower()
     part = stored["id"][0] if stored else next((t["part"] for t in topics if t["name"].lower() == topic), "")
-    return {"action": "replace" if stored else "add", "chunk_id": stored["id"] if stored else "", "part": part,
+    return {"action": "replace" if stored else "add", "chunk_id": f"{feature['id']}:{stored['id']}" if stored else "", "part": part,
             "title": stored["title"] if stored else question,
             "audience": stored["audience"] if stored else "Everyone",
             "body": solution, "old_text": stored["body"] if stored else "", "reason": "",
@@ -266,25 +267,25 @@ def apply_proposal(pid, mode, feature_id, part, title, audience, body, keywords_
     if not body:
         raise ValueError("The answer is empty")
     if mode == "replace":
-        chunk_id = (p.get("chunk_id") or "").strip()
-        if not chunk_id or feature_id != (p.get("extra") or {}).get("feature_id"):
+        m = KB_ID.match((p.get("chunk_id") or "").strip())
+        chunk_id = m.group(2) if m else ""
+        if not chunk_id or m.group(1) not in (None, feature_id) or feature_id != (p.get("extra") or {}).get("feature_id"):
             raise ValueError("Nothing is stored for this one. Use Add new")
     else:
         chunk_id = ""
         if not part.strip():
             raise ValueError("Pick a topic")
     kb = features.kb_path(feature)
-    if kb.resolve() != KB_PATH.resolve():
-        raise ValueError("This feature is not set up for review yet")
     audience_text = _audience_text(audience)
     english_title = _clean_body(_question_to_english(title))
     english = _clean_body(_to_english(body))  # before the KB is touched: a failed translation changes nothing
     with _lock:
         lines = kb.read_text(encoding="utf-8").splitlines()
         if mode == "replace":
-            new_lines, target = edit_chunk(lines, chunk_id, english_title, audience_text, english), chunk_id
+            new_lines, local = edit_chunk(lines, chunk_id, english_title, audience_text, english), chunk_id
         else:
-            new_lines, target = add_chunk(lines, part, english_title, audience_text, english)
+            new_lines, local = add_chunk(lines, part, english_title, audience_text, english)
+        target = f"{feature_id}:{local}"
         backup_dir = kb.parent / "kb_backups"
         backup_dir.mkdir(exist_ok=True)
         backup = backup_dir / f"kb_{datetime.now():%Y%m%d_%H%M%S}.md"

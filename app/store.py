@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from app.kb_common import KB_PATH, log_error, log_info
+from app.kb_common import KB_DIR, log_error, log_info
 
 DB_PATH = os.getenv("SQLITE_PATH") or "./data/app.db"
 EDITED_MIN_SIMILARITY = 0.5  # final reply this similar to the draft = "edited", below = "rewritten"
@@ -92,9 +92,12 @@ def init_db():
 
 
 def kb_version():
-    """Short fingerprint of the KB file, so a draft row says which KB produced it."""
+    """Short fingerprint of all KB files, so a draft row says which KB produced it."""
     try:
-        return hashlib.sha1(KB_PATH.read_bytes()).hexdigest()[:10]
+        h = hashlib.sha1()
+        for f in sorted(KB_DIR.glob("*.md")):
+            h.update(f.name.encode() + f.read_bytes())
+        return h.hexdigest()[:10]
     except OSError:
         return None
 
