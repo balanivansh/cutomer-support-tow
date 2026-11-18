@@ -2,6 +2,7 @@
 build_query -> [greeting/vague: clarify | anything else: retrieve]
 retrieve (reviewed KB only, no role filter) -> [KB similarity low: holding reply | else: draft]
 Public function: generate_draft(list_of_customer_messages) -> dict. It never sends anything."""
+import json
 import os
 import re
 import time
@@ -10,7 +11,7 @@ from typing import TypedDict
 from langgraph.graph import END, StateGraph
 
 from app.kb_common import embed, log_error, log_info
-from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, chat_json
+from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, LLMOutputTooLong, chat_json
 from app.prompts import build_clarify_messages, build_draft_messages, build_query_messages
 
 SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD") or 0.50)  # min dense similarity of the English query
@@ -89,9 +90,70 @@ def _add_tokens(state, usage):
     return t
 
 
+def _clean_questions(raw, intent, max_questions=4):
+    """Separate customer questions [{q, feature}] in the order asked, repeats removed. [] when there is only one."""
+    out, seen = [], set()
+    for item in raw if isinstance(raw, list) else []:
+        q = str(item.get("q") if isinstance(item, dict) else item or "").strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append({"q": q, "feature": str((item.get("feature") if isinstance(item, dict) else "") or "").strip()})
+    return out[:max_questions] if intent in ("real_question", "off_topic") and len(out) > 1 else []
+
+
+QUERY_MAX_TOKENS = int(os.getenv("QUERY_MAX_TOKENS") or 800)  # build_query output limit (reasoning + JSON)
+SHRINK_TARGET_CHARS = 800  # total size of the customer lines after the one-time shrink
+
+_SHRINK_PROMPT = ("Shorten these chat lines so that together they are under %d characters. Keep EVERY question, "
+                  "feature name (Tug of War, PK, Live...), number and the language/script of each line. Remove only "
+                  "filler and repeated words. Return JSON only: {\"lines\": [\"...\"]} with exactly %d items, same order.")
+
+
+def _shrink_thread(thread, conv_id):
+    """Only used when build_query was CUT by the token limit. One extra LLM call shortens the Customer lines
+    (the Agent lines stay as they are). Returns (shorter_thread, usage). Raises LLMError if it cannot."""
+    rows = [re.match(r"^(\d+)\.\s*([^:]+):\s*(.*)$", l) for l in thread.splitlines()]
+    cust = [m for m in rows if m and m.group(2).startswith("Customer")]
+    if not cust:
+        raise LLMError("nothing to shrink")
+    texts = [m.group(3) for m in cust]
+    data, usage, _ = chat_json(
+        [{"role": "system", "content": _SHRINK_PROMPT % (SHRINK_TARGET_CHARS, len(texts))},
+         {"role": "user", "content": json.dumps(texts, ensure_ascii=False)}],
+        QUERY_MODEL, 600, "shrink_context", conv_id)
+    new = data.get("lines")
+    if not isinstance(new, list) or len(new) != len(texts):
+        raise LLMError("shrink_context: wrong number of lines")
+    it = iter(new)
+    out = []
+    for l, m in zip(thread.splitlines(), rows):
+        out.append(f"{m.group(1)}. {m.group(2)}: {next(it)}" if m in cust else l)
+    return "\n".join(out), usage
+
+
 def n_build_query(state):
-    data, usage, _ = chat_json(build_query_messages(state["thread"]), QUERY_MODEL, 250,
-                               "build_query", state["conv_id"])
+    shrunk = None
+    try:
+        data, usage, _ = chat_json(build_query_messages(state["thread"]), QUERY_MODEL, QUERY_MAX_TOKENS,
+                                   "build_query", state["conv_id"])
+    except LLMOutputTooLong as first:
+        # Cut by the limit. ONE extra call shortens the customer lines, then build_query runs once more.
+        log_error("LLM_ERROR", "build_query", f"conv={state['conv_id']} output too long ({first.max_tokens} tokens). "
+                  f"Shrinking the customer lines (one extra call) and retrying once.")
+        try:
+            shrunk, u1 = _shrink_thread(state["thread"], state["conv_id"])
+            log_info("shrink_context", f"conv={state['conv_id']} before={len(state['thread'])} chars "
+                                       f"after={len(shrunk)} chars. Shrunk thread: {shrunk!r}")
+            data, usage, _ = chat_json(build_query_messages(shrunk), QUERY_MODEL, QUERY_MAX_TOKENS,
+                                       "build_query", state["conv_id"])
+            usage = {"in": usage["in"] + u1["in"] + first.usage["in"], "out": usage["out"] + u1["out"] + first.usage["out"]}
+        except LLMOutputTooLong as second:
+            second.first_raw, second.shrunk = first.raw, shrunk  # saved on the draft row for the reviewer
+            raise
+        except LLMError as e:
+            first.shrink_error = str(e)
+            first.shrunk = shrunk
+            raise first
     intent = data.get("intent") if data.get("intent") in {"greeting", "vague", "real_question", "off_topic"} \
         else "real_question"
     role = data.get("role_guess") if data.get("role_guess") in {"broadcaster", "participant"} else "unknown"
@@ -101,7 +163,10 @@ def n_build_query(state):
     info = {"intent": intent, "english_query": q, "role_guess": role,
             "language_and_script": _fix_language(state["thread"], data.get("language_and_script") or ""),
             "ambiguous": bool(data.get("ambiguous")),
-            "feature": (data.get("feature") or "unknown").strip()}
+            "feature": (data.get("feature") or "unknown").strip(),
+            "questions": _clean_questions(data.get("questions"), intent)}
+    if shrunk:
+        info["shrunk_thread"] = shrunk  # saved in query_json: shows what the AI really read
     log_info("build_query", f"conv={state['conv_id']} intent={intent} role={role} "
              f"lang={info['language_and_script']} ambiguous={info['ambiguous']} feature={info['feature']} query={q[:80]!r}")
     return {"query_info": info, "tokens": _add_tokens(state, usage)}
@@ -133,10 +198,32 @@ def n_retrieve(state):
     qv = embed([eq])[0]
     k = 3 if info["ambiguous"] else 2
     from app import features
-    from app.retriever import match_features
-    fids = match_features(info.get("feature"), features.load())
-    chunks = get_retriever().search(eq, role=None, top_k=k if len(fids) < 2 else max(k, len(fids)),
-                                    conv_id=state["conv_id"], query_vector=qv, feature_ids=fids)
+    from app.retriever import keyword_features, match_features
+    feats = features.load()
+    qs = info.get("questions") or [{"q": eq, "feature": info.get("feature")}]
+    per_q = 2 if len(qs) <= 2 else 1  # several questions: each gets its own search (fewer chunks each)
+    # thread lines look like "3. Customer: text" (numbered), so match the number first
+    customer_text = "\n".join(re.sub(r"^\d+\.\s*Customer:\s*", "", l) for l in state["thread"].splitlines()
+                              if re.match(r"^\d+\.\s*Customer:", l))
+    chunks, seen = [], set()
+    for item in qs:
+        q = item["q"]
+        fids = match_features(item.get("feature") or q, feats)
+        # Feature keywords ("tow" -> Tug of War), looked for in the customer's lines only. Soft signal.
+        hits = [f for f in keyword_features(q if len(qs) > 1 else customer_text + "\n" + q, feats) if f not in fids]
+        fids = fids + hits
+        search_q, search_v = q, (qv if q == eq else embed([q])[0])
+        names = [f["name"] for f in feats if f["id"] in hits and f["name"].lower() not in q.lower()]
+        if names:  # add the real feature name so the word match and the vectors see it
+            search_q = q + " " + " ".join(names)
+            search_v = embed([search_q])[0]
+            log_info("keywords", f"conv={state['conv_id']} matched={hits} query={search_q[:80]!r}")
+        k_q = k if len(qs) == 1 else per_q
+        for c in get_retriever().search(search_q, role=None, top_k=k_q if len(fids) < 2 else max(k_q, len(fids)),
+                                        conv_id=state["conv_id"], query_vector=search_v, feature_ids=fids):
+            if c["id"] not in seen:
+                seen.add(c["id"])
+                chunks.append(c)
     past = get_past_replies(eq, conv_id=state["conv_id"], query_vector=qv)
     top = max((c["dense_sim"] for c in chunks if c["dense_sim"] is not None), default=0.0)
     return {"chunks": chunks, "top_dense": top, "past": past}
@@ -157,8 +244,9 @@ def n_draft(state):
     chunks = state["chunks"]
     past = state.get("past") or []
     msgs = build_draft_messages(state["thread"], [{"id": c["id"], "text": c["text"], "feature": c.get("feature_name")} for c in chunks],
-                                past, LANG_NOTE[_lang_key(state["query_info"])])
-    data, usage, _ = chat_json(msgs, DRAFT_MODEL, 300, "draft", state["conv_id"])
+                                past, LANG_NOTE[_lang_key(state["query_info"])],
+                                [x["q"] for x in state["query_info"].get("questions") or []])
+    data, usage, _ = chat_json(msgs, DRAFT_MODEL, 600, "draft", state["conv_id"])
     status = data.get("status")
     draft = (data.get("draft") or "").strip().replace("\u2011", "-").replace("\u2010", "-") \
         .replace("\u202f", " ").replace("\u00a0", " ")
@@ -168,7 +256,13 @@ def n_draft(state):
                    f"{'an empty' if not draft else 'a'} draft. Using the safe holding reply.")
         status, draft = "NOT_IN_KB", HOLD_TEXT[lang]
     ids = {c["id"] for c in chunks} | {p["id"] for p in past}
-    used = [u for u in (data.get("used") or []) if u in ids]
+    used = []
+    for u in data.get("used") or []:
+        u = str(u).strip()
+        # the model sometimes drops the feature prefix ("B1" for "tow:B1"): map it back to the ids it was shown
+        for full in ([u] if u in ids else sorted(i for i in ids if i.split(":")[-1] == u)):
+            if full not in used:
+                used.append(full)
     log_info("draft", f"conv={state['conv_id']} status={status} used={used}")
     return {"result": {"status": status, "draft": draft, "used": used},
             "tokens": _add_tokens(state, usage)}
@@ -202,6 +296,13 @@ def generate_draft(messages, conv_id="local"):
     thread = "\n".join(f"{i + 1}. {m}" for i, m in enumerate(messages))
     try:
         out = _graph.invoke({"conv_id": conv_id, "thread": thread, "tokens": {"in": 0, "out": 0}})
+    except LLMOutputTooLong as e:
+        # Still too long after the one shrink: show the agent a clear message; keep the raw text for the reviewer.
+        log_error("LLM_ERROR", "pipeline", f"conv={conv_id} Generated answer is too large: {e}")
+        return {"status": "ERROR", "draft": "", "used": [], "error": "Generated answer is too large. "
+                "Please write the reply by hand.", "ms": int((time.time() - t0) * 1000),
+                "query": {"error": str(e), "raw_output": e.raw, "first_raw_output": getattr(e, "first_raw", None),
+                          "shrunk_thread": getattr(e, "shrunk", None), "english_query": "(output was cut)"}}
     except LLMError as e:
         log_error("LLM_ERROR", "pipeline", f"conv={conv_id} Draft could not be generated: {e}")
         return {"status": "ERROR", "draft": "", "used": [], "error": f"LLM problem: {e}",

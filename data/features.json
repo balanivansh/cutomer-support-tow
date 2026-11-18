@@ -24,7 +24,8 @@
    "kb_file": "popular-singer.md",
    "audiences": [
     "Broadcaster",
-    "Participant"
+    "Participant",
+    "test-user"
    ]
   },
   {

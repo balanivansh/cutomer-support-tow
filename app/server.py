@@ -2,6 +2,7 @@
 requests Generate. Nothing is sent automatically.
 Run from the project root:  uvicorn app.server:app --port 8000"""
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,10 +15,11 @@ from pydantic import BaseModel, Field
 
 from app import features, review, store
 from app.kb_common import log_error, log_info
-from app.llm import DRAFT_MODEL, QUERY_MODEL, LLMError, chat_json
+from app.llm import QUERY_MODEL, LLMError, chat_json
 from app.pipeline import generate_draft, get_retriever
 
 MAX_TEXT = 2000
+MAX_CTX_TEXT = 20000  # safety limit only; store.bound_context keeps the first 600 + last 400 characters of a long message
 REVIEW_HTML = Path(__file__).parent / "static" / "review.html"
 
 _generating = set()
@@ -53,7 +55,10 @@ class Text(BaseModel):
 
 class Msg(BaseModel):
     sender: Literal["customer", "agent"]
-    text: str
+    text: str = ""
+    # "media" = image, GIF or voice note (no text). Ignored completely: never read by the AI, and it does not
+    # mark the customer as answered (the portal normally does not send media at all; this is a safety net).
+    kind: Literal["text", "media"] = "text"
 
 
 class DraftRequest(BaseModel):
@@ -61,7 +66,6 @@ class DraftRequest(BaseModel):
     latest_message_id: int  # rox-chat chat_message.id of the newest message sent in `messages`
     messages: list[Msg] = Field(min_length=1, max_length=50)  # oldest first
     agent_user_id: int  # REQUIRED: who clicked Generate (the logged-in userId). No silent default.
-    customer_user_id: int | None = None  # the customer who sent the message (profile id), for the audit row
 
 
 class FeedbackRequest(BaseModel):
@@ -75,29 +79,48 @@ class FeedbackRequest(BaseModel):
 async def api_draft(body: DraftRequest):
     """Stateless draft: rox-chat sends the recent messages, gets the draft text back in one call."""
     cid = f"chat-{body.chat_id}"
-    items = [{"sender": m.sender, "text": m.text.strip()[:MAX_TEXT]} for m in body.messages if m.text.strip()]
+    # Media (image, GIF, voice) is ignored in both directions: never read, and never counts as an answer.
+    # Only a TEXT agent reply (the sent draft or a hand-typed text) marks the customer as answered.
+    items = [{"sender": m.sender, "text": m.text.strip()[:MAX_CTX_TEXT], "cut": len(m.text.strip()) > MAX_CTX_TEXT}
+             for m in body.messages if m.kind == "text" and m.text.strip()]
     context = store.bound_context(items)
     last_agent = max((n for n, m in enumerate(context) if m["sender"] == "agent"), default=-1)
     if not any(m["sender"] == "customer" for m in context[last_agent + 1:]):
         raise HTTPException(409, "There are no recent customer messages to answer")
-    if store.message_has_draft(body.chat_id, body.latest_message_id):
-        raise HTTPException(409, "A draft already exists for this customer message. Edit it instead")
+    truncated = any(m["cut"] for m in context if m["sender"] == "customer")
+    saved = store.get_message_draft(body.chat_id, body.latest_message_id)
+    if saved and saved["status"] == "ERROR" and saved["outcome"] == "pending":
+        store.delete_failed_draft(saved["id"])  # the old try failed: allow a new one
+        saved = None
+    if saved:
+        if saved["outcome"] != "pending":  # already sent: nothing to restore
+            raise HTTPException(409, "This customer message was already answered")
+        # Agent left the page before sending: give back the SAME saved draft. No new AI call, no new row.
+        log_info("api_draft", f"chat={body.chat_id} draft={saved['id']} restored (not sent yet)")
+        return {"draft_id": saved["id"], "status": saved["status"], "draft": saved["draft_text"] or "",
+                "used": json.loads(saved["used_chunks"] or "[]"), "ms": saved["ms"],
+                "truncated": truncated, "restored": True}
     if cid in _generating:
         raise HTTPException(409, "A draft is already being generated for this chat")
     _generating.add(cid)
     try:
-        lines = [f"{m['sender'].title()}: {m['text']}" for m in context]
+        # The customer message the last agent reply already answered stays as context, but is labelled so the
+        # AI does not answer it again (the label also keeps it out of the "Customer:" lines used for search).
+        lines = [f"{'Customer (already answered)' if m['sender'] == 'customer' and n < last_agent else m['sender'].title()}: {m['text']}"
+                 for n, m in enumerate(context)]
         log_info("api_context", f"chat={body.chat_id} received={len(items)} kept={len(context)} "
                                 f"chars={sum(len(m['text']) for m in context)} "
                                 f"first_kept={context[0]['text'][:40]!r}")
         async with _gate:
             result = await asyncio.to_thread(generate_draft, lines, cid)
-        draft_id = store.save_draft(body.chat_id, result, body.latest_message_id, body.agent_user_id,
-                                    body.customer_user_id, DRAFT_MODEL)
+        draft_id = store.save_draft(body.chat_id, result, body.latest_message_id, body.agent_user_id)
         log_info("api_draft", f"chat={body.chat_id} draft={draft_id} status={result.get('status')} "
-                              f"agent={body.agent_user_id} customer={body.customer_user_id}")
+                              f"agent={body.agent_user_id}")
+        if result.get("error"):
+            log_error("API_ERROR", "api_draft", f"chat={body.chat_id} draft={draft_id} {result['error']}")
         return {"draft_id": draft_id, "status": result.get("status"), "draft": result.get("draft", ""),
-                "used": result.get("used") or [], "ms": result.get("ms")}
+                "used": result.get("used") or [], "ms": result.get("ms"),
+                "truncated": truncated, "error": result.get("error") if result.get("status") == "ERROR" else None}
     except store.DraftExists:
         raise HTTPException(409, "A draft already exists for this customer message. Edit it instead")
     except Exception as e:
@@ -124,10 +147,11 @@ class Apply(BaseModel):
     mode: str = "replace"  # replace | add
     feature: str = ""
     part: str = ""  # topic letter, used by add only
+    chunk: str = ""  # replace only: the point to overwrite, e.g. "C1"
     title: str = ""  # the question
     audience: str = ""  # "Broadcaster, Participant" or "Everyone"
     body: str = ""
-    keywords: str = ""
+    keywords: str = ""  # feature search words typed by the reviewer (blank = none)
 
 
 class NewAudience(BaseModel):
@@ -136,12 +160,13 @@ class NewAudience(BaseModel):
 
 @app.get("/review")
 async def review_page():
-    return FileResponse(REVIEW_HTML)
+    return FileResponse(REVIEW_HTML, headers={"Cache-Control": "no-store"})  # always load the newest page
 
 
 def _feature_json(f):
     """One shape for GET and POST, so the page can use the POST result directly."""
-    return {"id": f["id"], "name": f["name"], "audiences": f.get("audiences", []), "topics": features.topics(f)}
+    return {"id": f["id"], "name": f["name"], "audiences": f.get("audiences", []),
+            "keywords": f.get("keywords", []), "topics": features.topics(f)}
 
 
 @app.get("/api/features")
@@ -188,22 +213,59 @@ async def review_list():
     return [p for p in store.list_proposals("pending") if p.get("extra")]  # cards from the old page have no extra
 
 
+@app.get("/api/review/staged")
+async def review_staged():
+    return store.list_proposals("staged")
+
+
 @app.post("/api/review/generate")
 async def review_generate():
     return {"count": await asyncio.to_thread(review.build_report)}
 
 
-@app.post("/api/review/{pid}/apply")
-async def review_apply(pid: int, b: Apply):
+@app.post("/api/review/cards")
+async def review_add_card():
+    """+ Add card: a blank card the reviewer fills in by hand."""
+    return store.get_proposal(review.add_manual_card())
+
+
+@app.get("/api/features/{fid}/points")
+async def feature_points(fid: str):
     try:
-        await asyncio.to_thread(review.apply_proposal, pid, b.mode, b.feature, b.part, b.title, b.audience,
-                                b.body, b.keywords)
+        return review.list_points(fid)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/review/{pid}/stage")
+async def review_stage(pid: int, b: Apply):
+    """Save card: checks the card and keeps it. The KB is NOT changed until Update KB."""
+    try:
+        review.stage_card(pid, b.mode, b.feature, b.part, b.title, b.audience, b.body, b.keywords, b.chunk)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/review/{pid}/unstage")
+async def review_unstage(pid: int):
+    try:
+        review.unstage_card(pid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/review/update-kb")
+async def review_update_kb():
+    """Update KB: writes ALL saved cards into the KB with one re-index. All or nothing."""
+    try:
+        return await asyncio.to_thread(review.update_kb)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        log_error("API_ERROR", "review", f"Applying proposal {pid} failed", e)
-        raise HTTPException(500, f"Could not apply the change: {e}")
-    return {"ok": True}
+        log_error("API_ERROR", "review", "Update KB failed", e)
+        raise HTTPException(500, f"Could not update the KB (nothing was changed): {e}")
 
 
 @app.post("/api/review/{pid}/reject")

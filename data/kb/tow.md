@@ -1,3 +1,5 @@
+**Search words:** tow, tug war, tug
+
 ## PART A: OVERVIEW
 
 ### A1. What is Tug of War?

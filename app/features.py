@@ -1,5 +1,9 @@
 """Features shown on the review page, kept in data/features.json (created on first use).
 Each feature: id, name, kb_file (a file inside data/) and audiences (names besides "Everyone").
+Search words (words customers use for the WHOLE feature, e.g. "tow"; used by search, see
+retriever.keyword_features) live in the feature's own KB file as one line above the first "## PART":
+    **Search words:** tow, tug war, tug
+They are blank unless a person adds them. load() puts them in each feature as "keywords".
 Topics are read from the KB file headings: "## PART B: BROADCASTER" gives the topic "Broadcaster"."""
 import json
 import re
@@ -9,6 +13,7 @@ from app.kb_common import DATA_DIR, KB_DIR, log_error
 
 FEATURES_PATH = DATA_DIR / "features.json"
 PART_RE = re.compile(r"^##\s+PART\s+([A-Z]):\s*(.*)$")
+WORDS_RE = re.compile(r"^\*\*Search words:\*\*\s*(.*)$")
 # The id is also the prefix of the chunk ids ("tow:B5"): never change it once chunks exist.
 # kb_file is a file inside data/kb/.
 _AUD = ["Broadcaster", "Participant"]
@@ -33,18 +38,63 @@ def _defaults():
 
 
 def _save(items):
-    FEATURES_PATH.write_text(json.dumps({"features": items}, ensure_ascii=False, indent=1), encoding="utf-8")
+    clean = [{k: v for k, v in f.items() if k != "keywords"} for f in items]  # search words live in the md file
+    FEATURES_PATH.write_text(json.dumps({"features": clean}, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def words_in_lines(lines):
+    """The feature's search words from the '**Search words:**' line above the first PART heading."""
+    for line in lines:
+        if PART_RE.match(line.rstrip()):
+            break
+        m = WORDS_RE.match(line.strip())
+        if m:
+            return merge_keywords([w for w in m.group(1).split(",")])
+    return []
+
+
+def add_words_to_lines(lines, words):
+    """Returns new lines with `words` merged into the search-words line (created above the first PART if missing)."""
+    merged = merge_keywords(words_in_lines(lines), words)
+    if not merged:
+        return lines
+    new = "**Search words:** " + ", ".join(merged)
+    out, done, seen_part = [], False, False
+    for line in lines:
+        if not seen_part and WORDS_RE.match(line.strip()):
+            if not done:
+                out.append(new)
+                done = True
+            continue  # drop the old line
+        if not seen_part and PART_RE.match(line.rstrip()):
+            seen_part = True
+            if not done:
+                out += [new, ""]
+                done = True
+        out.append(line)
+    if not done:
+        out += ["", new]
+    return out
+
+
+def _with_words(items):
+    for f in items:
+        try:
+            f["keywords"] = words_in_lines(kb_path(f).read_text(encoding="utf-8").splitlines())
+        except OSError:
+            f["keywords"] = []
+    return items
 
 
 def load():
     try:
-        return json.loads(FEATURES_PATH.read_text(encoding="utf-8"))["features"]
+        return _with_words(json.loads(FEATURES_PATH.read_text(encoding="utf-8"))["features"])
     except FileNotFoundError:
         _save(DEFAULTS)
-        return _defaults()
+        return _with_words(_defaults())
     except Exception as e:
         log_error("CONFIG_ERROR", "features", "Could not read features.json, using defaults", e)
-        return _defaults()
+        return _with_words(_defaults())
 
 
 def get(fid):
@@ -73,6 +123,21 @@ def topics(feature):
         if m:
             out.append({"part": m.group(1), "name": m.group(2).strip().title()})
     return out
+
+
+MAX_KEYWORDS = 30
+
+
+def merge_keywords(*lists):
+    """Joins word lists, drops repeats (case-insensitive), keeps the first MAX_KEYWORDS."""
+    seen, out = set(), []
+    for lst in lists:
+        for w in lst:
+            w = " ".join(str(w).split())
+            if w and len(w) <= 40 and w.lower() not in seen:
+                seen.add(w.lower())
+                out.append(w)
+    return out[:MAX_KEYWORDS]
 
 
 def add_audience(fid, name):
@@ -114,7 +179,7 @@ def add_feature(name, kb_file=None, audiences=None):
             "id": fid,
             "name": name,
             "kb_file": kb_file or f"{fid}.md",
-            "audiences": audiences or list(_AUD)
+            "audiences": audiences or list(_AUD),
         }
         path = kb_path(new_f)
         if path.exists():
@@ -122,7 +187,11 @@ def add_feature(name, kb_file=None, audiences=None):
         KB_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(TEMPLATE.format(name=name), encoding="utf-8")
         items.append(new_f)
-        _save(items)
+        try:
+            _save(items)
+        except Exception:
+            path.unlink(missing_ok=True)  # no orphan md file if features.json could not be saved
+            raise
         return new_f
 
 

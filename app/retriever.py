@@ -28,6 +28,17 @@ def match_features(hint, features):
     return out
 
 
+def keyword_features(text, features):
+    """Feature ids whose keywords appear (whole words, any case) in the customer's text, e.g. 'tow' -> Tug of War."""
+    out = []
+    for f in features:
+        for kw in f.get("keywords") or []:
+            if re.search(r"(?<!\w)" + re.escape(kw.lower()) + r"(?!\w)", text.lower()):
+                out.append(f["id"])
+                break
+    return out
+
+
 def tokenize(text):
     return [w for w in _SPLIT.split(text.lower()) if w]
 

@@ -28,14 +28,20 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .chk{display:inline-flex;align-items:center;margin:0 14px 6px 0;cursor:pointer}
 .small{max-width:460px}
 .small-btn{font-size:12px;padding:2px 8px;margin-left:6px;border-radius:4px;cursor:pointer}
+.ready{border-left:3px solid #1a8f4c}
+.ready .item{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:4px 0;border-top:1px solid var(--line)}
 </style>
 </head>
 <body>
 <h1>Weekly review</h1>
 <div class="top">
-  <button class="primary" id="gen">Generate report</button>
+  <button id="gen">Generate report</button>
+  <button id="addcard">+ Add card</button>
+  <button class="primary" id="upd" disabled>Update KB</button>
   <span class="mute" id="status"></span>
 </div>
+<div class="mute" style="margin-bottom:10px">Save card only keeps your edits. The KB changes (one re-index) only when you press Update KB.</div>
+<div id="staged"></div>
 <div id="list"></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -50,24 +56,32 @@ const parseAud = s => (s || '').split(',').map(a => a.trim()).filter(a => a && a
 let FEATURES = [];
 
 function card(p) {
-  const x = p.extra || {}, st = x.stored || null;
+  const x = p.extra || {}, st = x.stored || null, manual = !!x.manual, sg = x.stage || {};
   const c = el('div', 'card');
-  const n = p.feedback_ids.length;
-  c.append(el('div', 'mute', n + ' agent repl' + (n === 1 ? 'y' : 'ies') + ' on this topic'));
+  if (manual) c.append(el('div', 'mute', 'Manual card: you write the question and the answer.'));
+  else { const n = p.feedback_ids.length; c.append(el('div', 'mute', n + ' agent repl' + (n === 1 ? 'y' : 'ies') + ' on this topic')); }
 
-  const sd = el('div', 'stored');
-  const line = el('div');
-  line.append(el('b', '', 'What is currently stored: '), document.createTextNode(st ? st.title : 'Not stored'));
-  sd.append(line);
-  if (st) sd.append(el('pre', '', st.body));
-  c.append(sd);
-
+  if (!manual) {
+    const sd = el('div', 'stored');
+    const line = el('div');
+    line.append(el('b', '', 'What is currently stored: '), document.createTextNode(st ? st.title : 'Not stored'));
+    sd.append(line);
+    if (st) sd.append(el('pre', '', st.body));
+    c.append(sd);
+  }
+  if ((x.also_features || []).length) {
+    const w = el('div', 'err', 'Heads up: the agents answered from more than one feature (also: ' + x.also_features.join(', ') +
+      '). The KB keeps one feature per entry. Keep only the part about the feature you choose below; add the other feature on its own card or by hand.');
+    w.style.marginBottom = '8px'; c.append(w);
+  }
   // feature + topic
   const row = el('div', 'row2');
   const fw = el('div'), tw = el('div');
   const fsel = el('select'), tsel = el('select');
+  const fph = el('option', '', 'Choose feature...'); fph.value = ''; fsel.append(fph);
   FEATURES.forEach(f => { const o = el('option', '', f.name); o.value = f.id; fsel.append(o); });
-  fsel.value = x.feature_id || '';
+  fsel.value = sg.feature_id || x.feature_id || '';  // for auto cards: only set when found from the KB chunks the drafts used
+  const feat = () => FEATURES.find(f => f.id === fsel.value);
   const addFeatBtn = el('button', 'small-btn', '+ Add feature');
   addFeatBtn.type = 'button';
   addFeatBtn.onclick = async () => {
@@ -78,10 +92,10 @@ function card(p) {
       FEATURES.push(nf);
       const opt = el('option', '', nf.name); opt.value = nf.id;
       fsel.append(opt); fsel.value = nf.id;
-      drawTopics();
+      onFeature();
     } catch (e) { alert('Could not add feature: ' + e.message); }
   };
-  const fHeader = el('div', 'mute', 'Feature '); fHeader.append(addFeatBtn);
+  const fHeader = el('div', 'mute', 'Feature (required) '); fHeader.append(addFeatBtn);
   fw.append(fHeader, fsel);
 
   const addTopicBtn = el('button', 'small-btn', '+ Add topic/part');
@@ -99,25 +113,33 @@ function card(p) {
       if (hit) tsel.value = hit.part;
     } catch (e) { alert('Could not add topic: ' + e.message); }
   };
-  const tHeader = el('div', 'mute', 'Topic / Section '); tHeader.append(addTopicBtn);
+  const tHeader = el('div', 'mute', 'Topic / Section (required for a new point) '); tHeader.append(addTopicBtn);
   tw.append(tHeader, tsel);
-
   row.append(fw, tw);
+
+  // manual cards: add a new point, or replace an existing one
+  let act = null, pointSel = null, points = [];
+  if (manual) {
+    act = el('select');
+    [['add', 'Add as a new point'], ['replace', 'Replace an existing point']].forEach(([v, t]) => { const o = el('option', '', t); o.value = v; act.append(o); });
+    act.value = sg.mode || 'add';
+    pointSel = el('select');
+    c.append(el('div', 'mute', 'What do you want to do?'), act);
+  }
   c.append(row);
-  const feat = () => FEATURES.find(f => f.id === fsel.value);
+  if (manual) { const pl = el('div', 'mute', 'Existing point of the chosen topic (pick one: its question and answer load below so you can edit and replace)'); pl.id = 'pl'; c.append(pl, pointSel); }
+
   const drawTopics = () => {
     tsel.innerHTML = '';
     const ph = el('option', '', 'Choose topic...'); ph.value = ''; tsel.append(ph);
     ((feat() || {}).topics || []).forEach(t => { const o = el('option', '', t.name); o.value = t.part; tsel.append(o); });
-    const want = fsel.value === x.feature_id ? (p.part || '') : '';
+    const want = sg.part || ((st && fsel.value === x.feature_id) ? (p.part || '') : '');
     tsel.value = [...tsel.options].some(o => o.value === want) ? want : '';
   };
-  fsel.onchange = drawTopics;
-  drawTopics();
 
   c.append(el('div', 'mute', 'Question in English (KB heading & search)'));
   const question = el('input'); question.value = p.title || ''; c.append(question);
-  const qNotice = el('div', 'mute', 'ℹ️ Note: Auto-translated & cleaned into English for KB heading upon saving.');
+  const qNotice = el('div', 'mute', 'ℹ️ Note: Auto-translated & cleaned into English for KB heading when you press Update KB.');
   qNotice.style.fontSize = '12px'; qNotice.style.marginTop = '2px'; qNotice.style.marginBottom = '8px';
   c.append(qNotice);
 
@@ -136,18 +158,16 @@ function card(p) {
     audBox.append(mk('Everyone', !selected.length, v => { if (v) selected = []; drawAud(); }));
     [...new Set([...((feat() || {}).audiences || ['Broadcaster', 'Participant']), ...selected])].forEach(a =>
       audBox.append(mk(a, selected.includes(a), v => {
-        if (v) {
-          selected = [...selected.filter(s => s !== a), a];
-        } else {
-          selected = selected.filter(s => s !== a);
-        }
+        selected = v ? [...selected.filter(s => s !== a), a] : selected.filter(s => s !== a);
         drawAud();
       })));
     const addA = el('button', 'small-btn', '+ Add audience');
     addA.type = 'button';
     addA.onclick = async () => {
-      const f = feat(); const name = (prompt('New audience name') || '').trim();
-      if (!f || !name) return;
+      const f = feat();
+      if (!f) { msg.textContent = 'Choose a feature first, then add an audience.'; fsel.focus(); return; }
+      const name = (prompt('New audience name for ' + f.name) || '').trim();
+      if (!name) return;
       try {
         const r = await post('/api/features/' + f.id + '/audience', {name});
         f.audiences = r.audiences;
@@ -158,57 +178,147 @@ function card(p) {
     };
     audBox.append(addA);
   };
-  drawAud();
 
   c.append(el('div', 'mute', 'Answer (edit if needed)'));
   const body = el('textarea'); body.value = p.body || ''; c.append(body);
-  c.append(el('div', 'mute', 'Search words (comma separated)'));
+  c.append(el('div', 'mute', 'Feature search words (optional, leave blank if none): short forms customers use for the WHOLE feature, comma separated. Saved in the feature\'s KB file when you press Update KB.'));
+  const savedBox = el('div', 'mute'); c.append(savedBox);
   const kw = el('input', 'small'); kw.value = (p.keywords || []).join(', '); c.append(kw);
+  const showSaved = () => { const sv = (feat() || {}).keywords || []; savedBox.textContent = sv.length ? 'Already saved for this feature: ' + sv.join(', ') : ''; };
 
-  const rep = el('button', 'primary', 'Replace this Q&A');
-  const add = el('button', '', 'Add new');
-  const no = el('button', '', 'Reject');
-  const sync = () => { rep.disabled = !(st && fsel.value === x.feature_id); };
+  const drawPoints = () => {  // points of the chosen feature AND topic, e.g. "B1. Question..."
+    pointSel.innerHTML = '';
+    const ph = el('option', '', !fsel.value ? 'Choose a feature first...' : !tsel.value ? 'Choose a topic first...' : 'Choose a point...');
+    ph.value = ''; pointSel.append(ph);
+    points.filter(q => q.part === tsel.value).forEach(q => {
+      const o = el('option', '', q.id + '. ' + q.title); o.value = q.id; pointSel.append(o);
+    });
+    if (sg.chunk && points.some(q => q.id === sg.chunk && q.part === tsel.value)) pointSel.value = sg.chunk;
+  };
+  const loadPoints = async () => {
+    points = [];
+    if (fsel.value) { try { points = await api('/api/features/' + fsel.value + '/points'); } catch (e) { msg.textContent = e.message; } }
+    drawPoints();
+  };
+  const showMode = () => {
+    const rep = manual && act.value === 'replace';
+    pointSel.style.display = rep ? '' : 'none'; c.querySelector('#pl').style.display = rep ? '' : 'none';  // topic stays visible in both modes
+  };
+  const onFeature = () => { drawTopics(); drawAud(); showSaved(); if (manual) loadPoints(); sync(); };
+  const sync = () => { if (rep) rep.disabled = !(st && fsel.value === x.feature_id); };
+
+  const no = el('button', '', manual ? 'Discard card' : 'Reject');
+  let rep = null, add = null, save = null;
+  const btns = el('div');
+  if (manual) {
+    save = el('button', 'primary', 'Save card');
+    btns.append(save, ' ', no);
+  } else {
+    rep = el('button', 'primary', 'Save card: replace this Q&A');
+    add = el('button', '', 'Save card: add as new point');
+    btns.append(rep, ' ', add, ' ', no);
+  }
+  const all = () => [rep, add, save, no].filter(Boolean);
   const run = async (fn) => {
-    [rep, add, no].forEach(b => b.disabled = true); msg.textContent = '';
-    try { await fn(); c.remove(); left(); }
-    catch (e) { msg.textContent = e.message; add.disabled = false; no.disabled = false; sync(); }
+    all().forEach(b => b.disabled = true); msg.textContent = '';
+    try { await fn(); c.remove(); await loadStaged(); left(); }
+    catch (e) { msg.textContent = e.message; all().forEach(b => b.disabled = false); sync(); }
   };
-  const apply = mode => run(() => post('/api/review/' + p.id + '/apply', {
-    mode, feature: fsel.value, part: tsel.value, title: question.value, audience: selected.join(', '),
-    body: body.value, keywords: kw.value}));
-  rep.onclick = () => apply('replace');
-  add.onclick = () => {
-    if (st && question.value.trim() === st.title.trim()) {  // a new point needs its own question
-      const q = (x.llm_question || '').trim();
-      if (!q || q === st.title.trim()) { msg.textContent = 'Type a new question for the new point.'; return; }
-      question.value = q;
-      msg.textContent = 'New question filled in. Check it, then press Add new again.';
-      return;
+  const stage = (mode, chunk) => {
+    msg.textContent = '';
+    const missing = [];  // show EVERYTHING that is missing at once, not one field per click
+    if (!fsel.value) missing.push('Feature');
+    if (mode === 'add' && !tsel.value) missing.push('Topic / Section');
+    if (mode === 'replace' && !chunk) missing.push('the point to replace');
+    if (!question.value.trim()) missing.push('Question');
+    if (!body.value.trim()) missing.push('Answer');
+    if (missing.length) {
+      msg.textContent = 'Please fill: ' + missing.join(', ') + '.';
+      const first = !fsel.value ? fsel : (mode === 'add' && !tsel.value) ? tsel : !question.value.trim() ? question : body;
+      first.focus(); return;
     }
-    apply('add');
+    return run(() => post('/api/review/' + p.id + '/stage', {
+      mode, feature: fsel.value, part: tsel.value, chunk, title: question.value, audience: selected.join(', '),
+      body: body.value, keywords: kw.value}));
   };
+  if (manual) {
+    save.onclick = () => stage(act.value, pointSel.value);
+    act.onchange = () => { showMode(); };
+    pointSel.onchange = () => {
+      const q = points.find(z => z.id === pointSel.value); if (!q) return;
+      question.value = q.title; body.value = q.body; selected = parseAud(q.audience); drawAud(); tsel.value = q.part;
+    };
+  } else {
+    rep.onclick = () => stage('replace', st ? st.id : '');
+    add.onclick = () => {
+      if (st && question.value.trim() === st.title.trim()) {  // a new point needs its own question
+        const q = (x.llm_question || '').trim();
+        if (!q || q === st.title.trim()) { msg.textContent = 'Type a new question for the new point.'; return; }
+        question.value = q;
+        msg.textContent = 'New question filled in. Check it, then press Save card again.';
+        return;
+      }
+      stage('add', '');
+    };
+  }
   no.onclick = () => run(() => post('/api/review/' + p.id + '/reject'));
-  fsel.onchange = () => { drawTopics(); drawAud(); sync(); };
-
-  const btns = el('div'); btns.append(rep, ' ', add, ' ', no);
+  fsel.onchange = () => { msg.textContent = ''; onFeature(); };
+  tsel.onchange = () => { msg.textContent = ''; if (manual) drawPoints(); };
   c.append(btns, msg);
-  drawTopics(); drawAud(); sync();
+  onFeature();
+  if (manual) showMode();
   return c;
 }
 
-function left() { const n = $('list').children.length; $('status').textContent = n ? n + ' topic(s) to review' : 'Nothing left to review.'; }
+function left() { const n = $('list').children.length; $('status').textContent = n ? n + ' card(s) to review' : 'Nothing left to review.'; }
+
+let STAGED = [];
+async function loadStaged() {
+  STAGED = await api('/api/review/staged');
+  const box = $('staged'); box.innerHTML = '';
+  $('upd').disabled = !STAGED.length;
+  $('upd').textContent = STAGED.length ? 'Update KB (' + STAGED.length + ')' : 'Update KB';
+  if (!STAGED.length) return;
+  const t = el('div', 'card ready');
+  t.append(el('b', '', 'Ready for Update KB (' + STAGED.length + '). Nothing is in the KB yet.'));
+  STAGED.forEach(p => {
+    const sg = (p.extra || {}).stage || {};
+    const f = FEATURES.find(z => z.id === sg.feature_id) || {name: sg.feature_id};
+    const what = sg.mode === 'replace' ? 'Replace ' + sg.feature_id + ':' + sg.chunk : 'Add new to ' + f.name + ', topic ' + sg.part;
+    const item = el('div', 'item');
+    const left_ = el('div'); left_.append(el('b', '', what + ': '), document.createTextNode(p.title));
+    const b = el('div');
+    const edit = el('button', 'small-btn', 'Edit');
+    edit.onclick = async () => { try { await post('/api/review/' + p.id + '/unstage'); await load(); } catch (e) { alert(e.message); } };
+    const rm = el('button', 'small-btn', 'Remove');
+    rm.onclick = async () => { if (!confirm('Remove this card? Its agent replies stop being used.')) return; try { await post('/api/review/' + p.id + '/reject'); await load(); } catch (e) { alert(e.message); } };
+    b.append(edit, rm); item.append(left_, b); t.append(item);
+  });
+  box.append(t);
+}
 async function load() {
   FEATURES = await api('/api/features');
   const items = await api('/api/review/proposals');
   $('list').innerHTML = '';
   items.forEach(p => $('list').append(card(p)));
+  await loadStaged();
   left();
 }
 $('gen').onclick = async () => {
   $('gen').disabled = true; $('status').textContent = 'Generating... this can take a minute.';
   try { const r = await post('/api/review/generate'); await load(); if (!r.count) $('status').textContent = 'No new replies to review.'; }
   catch (e) { $('status').textContent = 'Failed: ' + e.message; }
+  $('gen').disabled = false;
+};
+$('addcard').onclick = async () => {
+  try { const p = await post('/api/review/cards'); $('list').prepend(card(p)); left(); window.scrollTo(0, 0); }
+  catch (e) { $('status').textContent = 'Failed: ' + e.message; }
+};
+$('upd').onclick = async () => {
+  if (!confirm('Update the KB with ' + STAGED.length + ' saved card(s)? The KB is re-indexed once; if anything fails, nothing changes.')) return;
+  $('upd').disabled = true; $('gen').disabled = true; $('status').textContent = 'Updating the KB... please wait (translating, backing up, re-indexing).';
+  try { const r = await post('/api/review/update-kb'); await load(); $('status').textContent = 'KB updated: ' + r.targets.join(', '); }
+  catch (e) { $('status').textContent = 'Failed (nothing was changed): ' + e.message; await loadStaged(); }
   $('gen').disabled = false;
 };
 load().catch(e => { $('status').textContent = 'Failed: ' + e.message; });

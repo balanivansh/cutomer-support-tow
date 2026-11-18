@@ -80,5 +80,11 @@ When the contest begins, a blinking Hand Voting icon appears in the room. Once a
 ### D2. How does 3x Bonus Voting work and when does it apply?
 3x Bonus Voting applies exclusively during active official room contest sessions. Gifts sent outside the official session, in private inboxes, or on posted songs count at the standard 1x rate.
 
-### D3. When does voting close, and who is declared the winner?
-Voting closes sharply at 8:00 PM (or the designated session end time). No votes can be cast after the timer ends. The singer with the highest total vote count is declared the winner and receives the exclusive Popular Singer Tag and Chat Bubble.
+### D3. When does voting close?
+**Audience:** Everyone
+Voting for the Popular Singer contest ends at 8:00 PM. No votes are accepted after that time.
+
+### D4. Who is declared the winner in the popular singer contest?
+**Audience:** Everyone
+The singer with the highest total vote count is declared the winner and receives the exclusive Popular Singer Tag and Chat Bubble.
+

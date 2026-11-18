@@ -19,6 +19,13 @@ class LLMError(Exception):
     """Raised when the LLM call cannot produce a usable answer after retries."""
 
 
+class LLMOutputTooLong(LLMError):
+    """The model hit max_tokens and its JSON was cut. Carries the raw cut text so it can be logged and saved."""
+    def __init__(self, stage, raw, usage, max_tokens):
+        super().__init__(f"{stage}: generated answer is too large (cut at max_tokens={max_tokens})")
+        self.raw, self.usage, self.max_tokens = raw, usage, max_tokens
+
+
 def _get_client():
     global _client
     if _client is None:
@@ -94,6 +101,11 @@ def chat_json(messages, model, max_tokens, stage, conv_id=None, attempts=3):
         try:
             return _parse_json(content), usage, ms
         except Exception as e:
+            if resp.choices[0].finish_reason == "length":
+                # Cut by the token limit: retrying with the same limit gives the same cut. Stop and report it.
+                log_error("LLM_ERROR", stage, f"{tag}Answer CUT at max_tokens={kwargs['max_tokens']} "
+                          f"(out={usage['out']}). Full raw output: {content!r}")
+                raise LLMOutputTooLong(stage, content, usage, kwargs["max_tokens"])
             last_problem = "invalid JSON"
             log_error("LLM_ERROR", stage, f"{tag}Answer was not valid JSON: {content[:120]!r}", e)
             continue
